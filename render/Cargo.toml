@@ -1,0 +1,11 @@
+[package]
+name = "render"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+raw-window-handle = "0.5.2"
+winit = "0.28.6"
+
+# Local
+util = { path = "../util" }
