@@ -3,4 +3,5 @@ name = "util"
 version = "0.1.0"
 edition = "2021"
 
-# No dependencies needed!
+[dependencies]
+bytemuck = { version = "1.13.1", features = ["derive"] }
