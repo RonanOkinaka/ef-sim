@@ -3,6 +3,7 @@
 //! functionality to operate; less code has fewer bugs!
 
 use std::ops::{Add, Sub, Mul};
+use bytemuck::{Pod, Zeroable};
 
 pub const RELAXED_EPSILON: f32 = 0.001;
 
@@ -11,7 +12,7 @@ pub fn almost_zero(value: f32) -> bool {
 }
 
 /// Represents one point in RxR.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Pod, Zeroable)]
 #[repr(C)]
 pub struct Point(pub f32, pub f32);
 
