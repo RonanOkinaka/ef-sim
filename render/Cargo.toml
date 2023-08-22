@@ -4,8 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+bytemuck = "1.13.1"
+pollster = "0.3.0"
 raw-window-handle = "0.5.2"
 winit = "0.28.6"
+wgpu = "0.17.0"
 
 # Local
 util = { path = "../util" }
