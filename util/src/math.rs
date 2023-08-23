@@ -2,8 +2,8 @@
 //! This is intentional, as this project needs very little mathematical
 //! functionality to operate; less code has fewer bugs!
 
-use std::ops::{Add, Sub, Mul};
 use bytemuck::{Pod, Zeroable};
+use std::ops::{Add, Mul, Sub};
 
 pub const RELAXED_EPSILON: f32 = 0.001;
 
@@ -52,7 +52,11 @@ impl Point {
             let a = self.0.abs();
             let b = self.1.abs();
 
-            if a < b { (a, b) } else { (b, a) }
+            if a < b {
+                (a, b)
+            } else {
+                (b, a)
+            }
         };
 
         let recip_b = 1.0 / b;

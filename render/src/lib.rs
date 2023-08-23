@@ -1,18 +1,15 @@
 //! Defines a small, simplified wrapper over a Winit window.
 
-use winit::{
-    event::{ElementState, Event, MouseButton, WindowEvent},
-    event_loop::EventLoop,
-    dpi::PhysicalSize,
-    window::{Window as WinitWindow, WindowBuilder},
-};
 use raw_window_handle::{
-    HasRawDisplayHandle,
-    HasRawWindowHandle,
-    RawDisplayHandle,
-    RawWindowHandle,
+    HasRawDisplayHandle, HasRawWindowHandle, RawDisplayHandle, RawWindowHandle,
 };
 use std::default::Default;
+use winit::{
+    dpi::PhysicalSize,
+    event::{ElementState, Event, MouseButton, WindowEvent},
+    event_loop::EventLoop,
+    window::{Window as WinitWindow, WindowBuilder},
+};
 
 /// Simplified cursor model containing its position and three major button states.
 #[derive(Clone, Copy, Debug, Default)]
@@ -52,7 +49,7 @@ impl Window {
     pub fn run<F1, F2>(mut self, mut on_redraw: F1, mut on_input: F2) -> !
     where
         F1: FnMut() + 'static,
-        F2: FnMut(InputEvent) + 'static
+        F2: FnMut(InputEvent) + 'static,
     {
         self.ev_loop.run(move |event, _, control_flow| {
             control_flow.set_wait();
@@ -71,32 +68,32 @@ impl Window {
                                 MouseButton::Left => {
                                     self.cursor.left_down = pressed;
                                     mouse_button = InputEventType::MouseLeft;
-                                },
+                                }
                                 MouseButton::Middle => {
                                     self.cursor.middle_down = pressed;
                                     mouse_button = InputEventType::MouseMiddle;
-                                },
+                                }
                                 MouseButton::Right => {
                                     self.cursor.right_down = pressed;
                                     mouse_button = InputEventType::MouseRight;
-                                },
+                                }
                                 _ => return,
                             }
 
                             on_input(InputEvent {
                                 reason: mouse_button,
-                                cursor: self.cursor
+                                cursor: self.cursor,
                             });
-                        },
+                        }
                         WindowEvent::CursorMoved { position, .. } => {
                             self.cursor.x = position.x as f32;
                             self.cursor.y = position.y as f32;
 
                             on_input(InputEvent {
                                 reason: InputEventType::MouseMoved,
-                                cursor: self.cursor
+                                cursor: self.cursor,
                             });
-                        },
+                        }
                         WindowEvent::KeyboardInput { input, .. } => {
                             if let Some(key) = input.virtual_keycode {
                                 let pressed = input.state == ElementState::Pressed;
@@ -105,11 +102,11 @@ impl Window {
                                     cursor: self.cursor,
                                 });
                             }
-                        },
-                        _ => { }, // TODO: Must implement window resizing for the renderer
+                        }
+                        _ => {} // TODO: Must implement window resizing for the renderer
                     }
-                },
-                _ => { },
+                }
+                _ => {}
             }
         });
     }
@@ -118,7 +115,7 @@ impl Window {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn with_size<T>(title: T, width: u32, height: u32) -> Self
     where
-        T: Into<String>
+        T: Into<String>,
     {
         let ev_loop = EventLoop::new();
         let window = WindowBuilder::new()
@@ -126,8 +123,12 @@ impl Window {
             .with_inner_size(PhysicalSize { width, height })
             .build(&ev_loop)
             .expect("Window creation failed");
-        
-        Self { ev_loop, window, cursor: Default::default() }
+
+        Self {
+            ev_loop,
+            window,
+            cursor: Default::default(),
+        }
     }
 
     pub fn get_size(&self) -> (u32, u32) {
