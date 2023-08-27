@@ -50,8 +50,6 @@ impl Window {
         F2: FnMut(InputEvent) + 'static,
     {
         self.ev_loop.run(move |event, _, control_flow| {
-            control_flow.set_wait();
-
             match event {
                 Event::RedrawRequested(window_id) if window_id == self.window.id() => on_redraw(),
                 Event::WindowEvent { window_id, event } if window_id == self.window.id() => {
@@ -104,6 +102,7 @@ impl Window {
                         _ => {} // TODO: Must implement window resizing for the renderer
                     }
                 }
+                Event::RedrawEventsCleared => self.window.request_redraw(),
                 _ => {}
             }
         });
