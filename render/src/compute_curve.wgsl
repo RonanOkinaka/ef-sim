@@ -3,7 +3,8 @@
 /// Temporary way for CPU to communicate with this shader.
 struct Command {
     pos: vec2<f32>,
-    _pad: vec2<u32>,
+    curve_index: u32,
+    _pad: u32,
 }
 
 /// One vertex of a line segment.
@@ -53,28 +54,36 @@ fn compute_main(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) 
     let cmd = commands[global_invocation_id.x];
 
     // Push the incoming point to this curve
-    push_vertex(cmd.pos);
+    push_vertex(cmd.pos, cmd.curve_index);
 }
 
-/// Calculate and write the values of:
+/// Given a new point and a curve, calculate and write the values of:
 ///  - Two vertices, placing them adjacent to each other
 ///  - Six indices (one quad)
 ///  - The midpoint for a curve that has 2+ points
-fn push_vertex(pos: vec2<f32>) {
+fn push_vertex(pos: vec2<f32>, curve_index: u32) {
+    var curve = curves[curve_index];
     let index = atomicAdd(&vertices.size, 2u);
 
     var new_ray = vec2<f32>(0.0, 0.0);
-    if (index >= 2u) {
+    if (curve.tail_index >= 0) {
         // If we have 2+ points, calculate the new ray based on the previous point
-        new_ray = calculate_new_rays(index - 2u, pos);
+        new_ray = calculate_new_rays(u32(curve.head_index), pos);
 
         // Write the indices out
-        push_quad_indices(index - 2u, index);
+        push_quad_indices(u32(curve.head_index), index);
+    }
+    else {
+        // If this is our first point, indicate that
+        curve.tail_index = i32(index);
     }
 
     // In all cases, write out the new point
     vertices.data[index     ] = Vertex(pos,  new_ray);
     vertices.data[index + 1u] = Vertex(pos, -new_ray);
+
+    curve.head_index = i32(index);
+    curves[curve_index] = curve;
 }
 
 /// Place the 6 indices (one quad) into the index buffer.

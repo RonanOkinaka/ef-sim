@@ -1,5 +1,6 @@
 //! Define the type responsible for rendering lines.
 
+use bytemuck::{Pod, Zeroable};
 use std::sync::mpsc;
 use util::math::Point;
 
@@ -13,13 +14,21 @@ pub struct LineRenderer {
     compute_binding: wgpu::BindGroup,
     compute_pipeline: wgpu::ComputePipeline,
 
-    rx: mpsc::Receiver<Point>,
+    rx: mpsc::Receiver<(Point, u32)>,
     num_indices: u64,
 }
 
 /// State required for requesting a line be rendered.
 pub struct LineSender {
-    tx: mpsc::Sender<Point>,
+    tx: mpsc::Sender<(Point, u32)>,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct CurveCommand {
+    pos: Point,
+    curve_index: u32,
+    _pad: u32,
 }
 
 pub fn line_renderer(
@@ -44,13 +53,21 @@ impl LineRenderer {
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
-        let points: Vec<Point> = self.rx.try_iter().collect();
+        let commands: Vec<CurveCommand> = self
+            .rx
+            .try_iter()
+            .map(|(pos, curve_index)| CurveCommand {
+                pos,
+                curve_index,
+                _pad: 0,
+            })
+            .collect();
 
-        if !points.is_empty() {
+        if !commands.is_empty() {
             queue.write_buffer(
                 &self.compute_command_buf,
                 0,
-                bytemuck::cast_slice(points.as_slice()),
+                bytemuck::cast_slice(commands.as_slice()),
             );
 
             // TODO: temporary hack, this will be replaced with compute-driven
@@ -58,13 +75,13 @@ impl LineRenderer {
             if self.num_indices == 1 {
                 self.num_indices = 0;
             } else {
-                self.num_indices += 6 * points.len() as u64;
+                self.num_indices += 6 * commands.len() as u64;
             }
 
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
             pass.set_pipeline(&self.compute_pipeline);
             pass.set_bind_group(0, &self.compute_binding, &[]);
-            pass.dispatch_workgroups(points.len() as u32, 1, 1);
+            pass.dispatch_workgroups(commands.len() as u32, 1, 1);
         }
 
         {
@@ -95,7 +112,7 @@ impl LineRenderer {
         device: &wgpu::Device,
         adapter: &wgpu::Adapter,
         surface: &wgpu::Surface,
-        rx: mpsc::Receiver<Point>,
+        rx: mpsc::Receiver<(Point, u32)>,
     ) -> Self {
         // Create the index and vertex buffers
         let vertex_buf = create_buffer_with_intro(device, wgpu::BufferUsages::VERTEX, &[0]);
@@ -261,8 +278,12 @@ impl LineRenderer {
 }
 
 impl LineSender {
-    pub fn push_point(&self, point: Point) -> Result<(), mpsc::SendError<Point>> {
-        self.tx.send(point)
+    pub fn push_point(
+        &self,
+        point: Point,
+        curve: u32,
+    ) -> Result<(), mpsc::SendError<(Point, u32)>> {
+        self.tx.send((point, curve))
     }
 }
 
