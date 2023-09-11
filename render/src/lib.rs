@@ -1,6 +1,7 @@
 //! Re-export the relevant (i.e. public) parts of modules from this workspace.
 
 mod line;
+mod shader;
 mod window;
 
 pub use line::*;

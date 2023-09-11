@@ -1,42 +1,15 @@
-//! Abstract the idea of a curve as a series of line segments.
+//! Compute shader responsible for pushing points to curves.
 
 /// Temporary way for CPU to communicate with this shader.
-struct Command {
+struct PushCommand {
     pos: vec2<f32>,
     curve_index: u32,
     _pad: u32,
 }
 
-/// One vertex of a line segment.
-struct Vertex {
-    pos: vec2<f32>,
-    ray: vec2<f32>,
-}
-
-/// Structure of the vertex buffer, which includes its size.
-struct VertexBuffer {
-    size: atomic<u32>,
-    _pad: u32, // Explicit pad is easier to read
-    data: array<Vertex>,
-}
-
-/// Structure of the index buffer, which includes its size.
-struct IndexBuffer {
-    size: atomic<u32>,
-    _pad: u32,
-    data: array<u32>,
-}
-
-/// Represents a curve as a linked list of points with line
-/// segments between them.
-struct Curve {
-    head_index: i32,
-    tail_index: i32,
-}
-
 
 /// Data required to push a point.
-@group(0) @binding(0) var<uniform> commands: array<Command, 16384>;
+@group(0) @binding(0) var<uniform> commands: array<PushCommand, 16384>;
 
 /// Vertex buffer.
 @group(0) @binding(1) var<storage, read_write> vertices: VertexBuffer;

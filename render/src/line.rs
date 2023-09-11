@@ -4,6 +4,8 @@ use bytemuck::{Pod, Zeroable};
 use std::sync::mpsc;
 use util::math::Point;
 
+use crate::shader::WgslLoader;
+
 /// State required for rendering lines.
 pub struct LineRenderer {
     vertex_buf: wgpu::Buffer,
@@ -119,12 +121,10 @@ impl LineRenderer {
         let index_buf = create_buffer_with_intro(device, wgpu::BufferUsages::INDEX, &[0]);
 
         // Load the shaders
-        let render_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: None,
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
-                "draw_line.wgsl"
-            ))),
-        });
+        let mut shader_loader = WgslLoader::new();
+        shader_loader.add_common_source(include_str!("common.wgsl"));
+
+        let render_shader = shader_loader.create_shader(device, include_str!("draw_line.wgsl"));
 
         // Describe and create the render pipeline
         let render_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -202,12 +202,8 @@ impl LineRenderer {
             push_constant_ranges: &[],
         });
 
-        let compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: None,
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
-                "compute_curve.wgsl"
-            ))),
-        });
+        let compute_shader =
+            shader_loader.create_shader(device, include_str!("compute_curve.wgsl"));
 
         let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: None,
