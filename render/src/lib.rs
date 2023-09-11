@@ -1,5 +1,6 @@
 //! Re-export the relevant (i.e. public) parts of modules from this workspace.
 
+mod compute_shader;
 mod line;
 mod shader;
 mod window;

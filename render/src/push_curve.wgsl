@@ -23,7 +23,7 @@ struct PushCommand {
 
 @compute
 @workgroup_size(1) // TODO: Update to better value!
-fn compute_main(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
+fn push_curve_main(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
     let cmd = commands[global_invocation_id.x];
 
     // Push the incoming point to this curve

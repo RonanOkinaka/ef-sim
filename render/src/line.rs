@@ -4,6 +4,7 @@ use bytemuck::{Pod, Zeroable};
 use std::sync::mpsc;
 use util::math::Point;
 
+use crate::compute_shader::*;
 use crate::shader::WgslLoader;
 
 /// State required for rendering lines.
@@ -13,8 +14,7 @@ pub struct LineRenderer {
     render_pipeline: wgpu::RenderPipeline,
 
     compute_command_buf: wgpu::Buffer,
-    compute_binding: wgpu::BindGroup,
-    compute_pipeline: wgpu::ComputePipeline,
+    compute_push_curve: ComputePipeline,
 
     rx: mpsc::Receiver<(Point, u32)>,
     num_indices: u64,
@@ -80,10 +80,8 @@ impl LineRenderer {
                 self.num_indices += 6 * commands.len() as u64;
             }
 
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
-            pass.set_pipeline(&self.compute_pipeline);
-            pass.set_bind_group(0, &self.compute_binding, &[]);
-            pass.dispatch_workgroups(commands.len() as u32, 1, 1);
+            self.compute_push_curve
+                .run(&mut encoder, commands.len() as u32);
         }
 
         {
@@ -157,62 +155,9 @@ impl LineRenderer {
         });
 
         // Describe and create the compute pipeline
-        let bind_group_layout_entry_default = wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        };
+        let push_curve_shader =
+            shader_loader.create_shader(device, include_str!("push_curve.wgsl"));
 
-        let compute_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: None,
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        ..bind_group_layout_entry_default
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        ..bind_group_layout_entry_default
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        ..bind_group_layout_entry_default
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 3,
-                        ..bind_group_layout_entry_default
-                    },
-                ],
-            });
-
-        let compute_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None,
-            bind_group_layouts: &[&compute_bind_group_layout],
-            push_constant_ranges: &[],
-        });
-
-        let compute_shader =
-            shader_loader.create_shader(device, include_str!("compute_curve.wgsl"));
-
-        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: None,
-            layout: Some(&compute_layout),
-            module: &compute_shader,
-            entry_point: "compute_main",
-        });
-
-        // Create the compute shader buffers
         let compute_command_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: 16384,
@@ -221,52 +166,24 @@ impl LineRenderer {
         });
         let curve_buf = create_buffer_with_intro(device, wgpu::BufferUsages::COPY_DST, &[-1; 10]);
 
-        let compute_binding = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &compute_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &compute_command_buf,
-                        offset: 0,
-                        size: None,
-                    }),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &vertex_buf,
-                        offset: 0,
-                        size: None,
-                    }),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &index_buf,
-                        offset: 0,
-                        size: None,
-                    }),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &curve_buf,
-                        offset: 0,
-                        size: None,
-                    }),
-                },
+        let compute_push_curve = ComputePipeline::new(
+            device,
+            &[
+                ComputePipelineBuffer::Uniform(&compute_command_buf),
+                ComputePipelineBuffer::Storage(&vertex_buf),
+                ComputePipelineBuffer::Storage(&index_buf),
+                ComputePipelineBuffer::Storage(&curve_buf),
             ],
-        });
+            push_curve_shader,
+            "push_curve_main",
+        );
 
         Self {
             vertex_buf,
             index_buf,
             render_pipeline,
             compute_command_buf,
-            compute_binding,
-            compute_pipeline,
+            compute_push_curve,
             rx,
             num_indices: 1,
         }
