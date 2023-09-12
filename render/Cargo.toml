@@ -12,3 +12,4 @@ wgpu = "0.17.0"
 
 # Local
 util = { path = "../util" }
+regex = "1.9.5"

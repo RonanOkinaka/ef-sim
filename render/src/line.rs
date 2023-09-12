@@ -203,13 +203,17 @@ impl LineRenderer {
             multiview: None,
         });
 
+        // Common compute shader data
+        let command_buf_size = device.limits().max_uniform_buffer_binding_size.min(32768) as u64;
+        shader_loader.bind("COMMAND_BUF_SIZE", (command_buf_size / 16).to_string()); // Divide by size
+
         // Describe and create the push pipeline
         let push_curve_shader =
             shader_loader.create_shader(device, include_str!("push_curve.wgsl"));
 
         let compute_push_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
-            size: 16384,
+            size: command_buf_size,
             mapped_at_creation: false,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::UNIFORM,
         });
@@ -230,7 +234,7 @@ impl LineRenderer {
         // Describe and create the pop pipeline
         let compute_pop_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
-            size: 16384,
+            size: command_buf_size,
             mapped_at_creation: false,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::UNIFORM,
         });

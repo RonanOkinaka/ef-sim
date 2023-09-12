@@ -6,14 +6,18 @@ struct PopCommand {
     curve_index: vec4<u32>,
 }
 
+
 /// Data required to pop a point.
-@group(0) @binding(0) var<uniform> commands: array<PopCommand, 16384>;
+@group(0) @binding(0) var<uniform> commands: array<PopCommand, $$COMMAND_BUF_SIZE$$>;
 
 /// Vertex buffer.
 @group(0) @binding(1) var<storage, read_write> vertices: VertexBuffer;
 
 /// Array of active curves.
 @group(0) @binding(2) var<storage, read_write> curves: array<Curve>;
+
+///
+@group(0) @binding(3) var<storage, read_write> free_list: array<Curve>;
 
 
 @compute

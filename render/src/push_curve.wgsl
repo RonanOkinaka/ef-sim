@@ -9,7 +9,7 @@ struct PushCommand {
 
 
 /// Data required to push a point.
-@group(0) @binding(0) var<uniform> commands: array<PushCommand, 16384>;
+@group(0) @binding(0) var<uniform> commands: array<PushCommand, $$COMMAND_BUF_SIZE$$>;
 
 /// Vertex buffer.
 @group(0) @binding(1) var<storage, read_write> vertices: VertexBuffer;
