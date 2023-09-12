@@ -13,24 +13,36 @@ pub struct LineRenderer {
     index_buf: wgpu::Buffer,
     render_pipeline: wgpu::RenderPipeline,
 
-    compute_command_buf: wgpu::Buffer,
+    compute_push_buf: wgpu::Buffer,
     compute_push_curve: ComputePipeline,
 
-    rx: mpsc::Receiver<(Point, u32)>,
+    compute_pop_buf: wgpu::Buffer,
+    compute_pop_curve: ComputePipeline,
+
+    push_rx: mpsc::Receiver<(Point, u32)>,
+    pop_rx: mpsc::Receiver<u32>,
     num_indices: u64,
 }
 
 /// State required for requesting a line be rendered.
 pub struct LineSender {
-    tx: mpsc::Sender<(Point, u32)>,
+    push_tx: mpsc::Sender<(Point, u32)>,
+    pop_tx: mpsc::Sender<u32>,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct CurveCommand {
+struct PushCommand {
     pos: Point,
     curve_index: u32,
     _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PopCommand {
+    curve_index: u32,
+    _pad: [u32; 3],
 }
 
 pub fn line_renderer(
@@ -38,10 +50,11 @@ pub fn line_renderer(
     adapter: &wgpu::Adapter,
     surface: &wgpu::Surface,
 ) -> (LineSender, LineRenderer) {
-    let (tx, rx) = mpsc::channel();
-    let renderer = LineRenderer::with_channel(device, adapter, surface, rx);
+    let (push_tx, push_rx) = mpsc::channel();
+    let (pop_tx, pop_rx) = mpsc::channel();
+    let renderer = LineRenderer::with_channel(device, adapter, surface, push_rx, pop_rx);
 
-    (LineSender { tx }, renderer)
+    (LineSender { push_tx, pop_tx }, renderer)
 }
 
 impl LineRenderer {
@@ -55,21 +68,21 @@ impl LineRenderer {
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
-        let commands: Vec<CurveCommand> = self
-            .rx
+        let push_commands: Vec<PushCommand> = self
+            .push_rx
             .try_iter()
-            .map(|(pos, curve_index)| CurveCommand {
+            .map(|(pos, curve_index)| PushCommand {
                 pos,
                 curve_index,
                 _pad: 0,
             })
             .collect();
 
-        if !commands.is_empty() {
+        if !push_commands.is_empty() {
             queue.write_buffer(
-                &self.compute_command_buf,
+                &self.compute_push_buf,
                 0,
-                bytemuck::cast_slice(commands.as_slice()),
+                bytemuck::cast_slice(push_commands.as_slice()),
             );
 
             // TODO: temporary hack, this will be replaced with compute-driven
@@ -77,11 +90,31 @@ impl LineRenderer {
             if self.num_indices == 1 {
                 self.num_indices = 0;
             } else {
-                self.num_indices += 6 * commands.len() as u64;
+                self.num_indices += 6 * push_commands.len() as u64;
             }
 
             self.compute_push_curve
-                .run(&mut encoder, commands.len() as u32);
+                .run(&mut encoder, push_commands.len() as u32);
+        }
+
+        let pop_commands: Vec<PopCommand> = self
+            .pop_rx
+            .try_iter()
+            .map(|curve_index| PopCommand {
+                curve_index,
+                _pad: [0; 3],
+            })
+            .collect();
+
+        if !pop_commands.is_empty() {
+            queue.write_buffer(
+                &self.compute_pop_buf,
+                0,
+                bytemuck::cast_slice(pop_commands.as_slice()),
+            );
+
+            self.compute_pop_curve
+                .run(&mut encoder, pop_commands.len() as u32);
         }
 
         {
@@ -112,7 +145,8 @@ impl LineRenderer {
         device: &wgpu::Device,
         adapter: &wgpu::Adapter,
         surface: &wgpu::Surface,
-        rx: mpsc::Receiver<(Point, u32)>,
+        push_rx: mpsc::Receiver<(Point, u32)>,
+        pop_rx: mpsc::Receiver<u32>,
     ) -> Self {
         // Create the index and vertex buffers
         let vertex_buf = create_buffer_with_intro(device, wgpu::BufferUsages::VERTEX, &[0]);
@@ -138,15 +172,30 @@ impl LineRenderer {
                 module: &render_shader,
                 entry_point: "vertex_main",
                 buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: 2 * std::mem::size_of::<Point>() as u64,
+                    array_stride: 4 * 6, // 6 units of 4 bytes each (see below)
                     step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2],
+                    attributes: &wgpu::vertex_attr_array![
+                        0 => Float32x2,
+                        1 => Float32x2,
+                        2 => Float32,
+                        3 => Sint32,
+                    ],
                 }],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &render_shader,
                 entry_point: "fragment_main",
-                targets: &[Some(surface.get_capabilities(adapter).formats[0].into())],
+                targets: &[Some(wgpu::ColorTargetState {
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::SrcAlpha,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent::OVER,
+                    }),
+                    ..surface.get_capabilities(adapter).formats[0].into()
+                })],
             }),
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
@@ -154,11 +203,11 @@ impl LineRenderer {
             multiview: None,
         });
 
-        // Describe and create the compute pipeline
+        // Describe and create the push pipeline
         let push_curve_shader =
             shader_loader.create_shader(device, include_str!("push_curve.wgsl"));
 
-        let compute_command_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        let compute_push_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: 16384,
             mapped_at_creation: false,
@@ -169,7 +218,7 @@ impl LineRenderer {
         let compute_push_curve = ComputePipeline::new(
             device,
             &[
-                ComputePipelineBuffer::Uniform(&compute_command_buf),
+                ComputePipelineBuffer::Uniform(&compute_push_buf),
                 ComputePipelineBuffer::Storage(&vertex_buf),
                 ComputePipelineBuffer::Storage(&index_buf),
                 ComputePipelineBuffer::Storage(&curve_buf),
@@ -178,25 +227,52 @@ impl LineRenderer {
             "push_curve_main",
         );
 
+        // Describe and create the pop pipeline
+        let compute_pop_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 16384,
+            mapped_at_creation: false,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::UNIFORM,
+        });
+
+        let compute_pop_curve = ComputePipeline::new(
+            device,
+            &[
+                ComputePipelineBuffer::Uniform(&compute_pop_buf),
+                ComputePipelineBuffer::Storage(&vertex_buf),
+                ComputePipelineBuffer::Storage(&curve_buf),
+            ],
+            shader_loader.create_shader(device, include_str!("pop_curve.wgsl")),
+            "pop_curve_main",
+        );
+
         Self {
             vertex_buf,
             index_buf,
             render_pipeline,
-            compute_command_buf,
+            compute_push_buf,
             compute_push_curve,
-            rx,
+            compute_pop_buf,
+            compute_pop_curve,
+            push_rx,
+            pop_rx,
             num_indices: 1,
         }
     }
 }
 
+// TODO: This should be a memory-mapped shared buffer
 impl LineSender {
     pub fn push_point(
         &self,
         point: Point,
         curve: u32,
     ) -> Result<(), mpsc::SendError<(Point, u32)>> {
-        self.tx.send((point, curve))
+        self.push_tx.send((point, curve))
+    }
+
+    pub fn pop_point(&self, curve: u32) -> Result<(), mpsc::SendError<u32>> {
+        self.pop_tx.send(curve)
     }
 }
 

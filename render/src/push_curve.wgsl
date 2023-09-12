@@ -45,6 +45,9 @@ fn push_vertex(pos: vec2<f32>, curve_index: u32) {
 
         // Write the indices out
         push_quad_indices(u32(curve.head_index), index);
+
+        // Push the linked list
+        vertices.data[curve.head_index].next = i32(index);
     }
     else {
         // If this is our first point, indicate that
@@ -52,8 +55,8 @@ fn push_vertex(pos: vec2<f32>, curve_index: u32) {
     }
 
     // In all cases, write out the new point
-    vertices.data[index     ] = Vertex(pos,  new_ray);
-    vertices.data[index + 1u] = Vertex(pos, -new_ray);
+    vertices.data[index     ] = Vertex(pos,  new_ray, 1.0, -1);
+    vertices.data[index + 1u] = Vertex(pos, -new_ray, 1.0, -1);
 
     curve.head_index = i32(index);
     curves[curve_index] = curve;
@@ -68,10 +71,10 @@ fn push_quad_indices(i: u32, j: u32) {
     indices.data[index + 1u] = i + 1u;
     indices.data[index + 2u] = j;
 
-    // 3, 2, 1
-    indices.data[index + 3u] = j + 1u;
-    indices.data[index + 4u] = j;
-    indices.data[index + 5u] = i + 1u;
+    // 1, 3, 2
+    indices.data[index + 3u] = i + 1u;
+    indices.data[index + 4u] = j + 1u;
+    indices.data[index + 5u] = j;
 }
 
 /// Compute the rays for the current- and mid-point of the segment list.

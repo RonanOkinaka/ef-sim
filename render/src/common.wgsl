@@ -2,8 +2,10 @@
 
 /// One vertex of a line segment.
 struct Vertex {
-    pos: vec2<f32>,
-    ray: vec2<f32>,
+    @location(0) pos: vec2<f32>,
+    @location(1) ray: vec2<f32>,
+    @location(2) alpha: f32,
+    @location(3) next: i32,
 }
 
 /// Structure of the vertex buffer, which includes its size.

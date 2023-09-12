@@ -94,6 +94,11 @@ async fn run_async() -> ! {
                         VirtualKeyCode::Key3 => curve_index = 2,
                         VirtualKeyCode::Key4 => curve_index = 3,
                         VirtualKeyCode::Key5 => curve_index = 4,
+                        VirtualKeyCode::Space => {
+                            sender
+                                .pop_point(curve_index)
+                                .expect("Render thread should never hang up");
+                        }
                         _ => {}
                     }
                 }
