@@ -10,16 +10,16 @@ struct Vertex {
 
 /// Structure of the vertex buffer, which includes its size.
 struct VertexBuffer {
-    size: atomic<u32>,
+    size: atomic<i32>,
     _pad: u32, // Explicit pad is easier to read
     data: array<Vertex>,
 }
 
 /// Structure of the index buffer, which includes its size.
 struct IndexBuffer {
-    size: atomic<u32>,
+    size: atomic<i32>,
     _pad: u32,
-    data: array<u32>,
+    data: array<i32>,
 }
 
 /// Represents a curve as a linked list of points with line
