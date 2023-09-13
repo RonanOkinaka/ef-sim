@@ -20,6 +20,9 @@ struct PushCommand {
 /// Array of active curves.
 @group(0) @binding(3) var<storage, read_write> curves: array<Curve>;
 
+/// Allocator free-list.
+@group(0) @binding(4) var<storage, read_write> free_list: TotalFreeList;
+
 
 @compute
 @workgroup_size(1) // TODO: Update to better value!
@@ -36,35 +39,60 @@ fn push_curve_main(@builtin(global_invocation_id) global_invocation_id: vec3<u32
 ///  - The midpoint for a curve that has 2+ points
 fn push_vertex(pos: vec2<f32>, curve_index: u32) {
     var curve = curves[curve_index];
-    let index = atomicAdd(&vertices.size, 2);
+    let vertex_index = allocate_vertices();
 
+    var index_index = -1;
     var new_ray = vec2<f32>(0.0, 0.0);
     if (curve.tail_index >= 0) {
         // If we have 2+ points, calculate the new ray based on the previous point
         new_ray = calculate_new_rays(curve.head_index, pos);
 
         // Write the indices out
-        push_quad_indices(curve.head_index, index);
+        index_index = push_quad_indices(curve.head_index, vertex_index);
 
         // Push the linked list
-        vertices.data[curve.head_index].next = index;
+        vertices.data[curve.head_index].next = vertex_index;
     }
     else {
         // If this is our first point, indicate that
-        curve.tail_index = index;
+        curve.tail_index = vertex_index;
     }
 
     // In all cases, write out the new point
-    vertices.data[index    ] = Vertex(pos,  new_ray, 1.0, -1);
-    vertices.data[index + 1] = Vertex(pos, -new_ray, 1.0, -1);
+    vertices.data[vertex_index    ] = Vertex(pos,  new_ray, 1.0, -1);
+    // The vertex above stores the <next> node in the linked list (-1 == nothing)
+    // The one below stores the index into the index buffer
+    vertices.data[vertex_index + 1] = Vertex(pos, -new_ray, 1.0, index_index);
 
-    curve.head_index = index;
+    curve.head_index = vertex_index;
     curves[curve_index] = curve;
 }
 
+/// Allocate space for two vertices.
+fn allocate_vertices() -> i32 {
+    let size = atomicSub(&free_list.vertices.size, 1);
+    if (size <= 0) {
+        atomicAdd(&free_list.vertices.size, 1);
+        return atomicAdd(&vertices.size, 2);
+    }
+
+    return free_list.vertices.data[size - 1];
+}
+
+/// Allocate space for six indices.
+fn allocate_indices() -> i32 {
+    let size = atomicSub(&free_list.indices.size, 1);
+    if (size <= 0) {
+        atomicAdd(&free_list.indices.size, 1);
+        return atomicAdd(&indices.size, 6);
+    }
+
+    return free_list.indices.data[size - 1];
+}
+
 /// Place the 6 indices (one quad) into the index buffer.
-fn push_quad_indices(i: i32, j: i32) {
-    let index = atomicAdd(&indices.size, 6);
+fn push_quad_indices(i: i32, j: i32) -> i32 {
+    let index = allocate_indices();
 
     // 0, 1, 2
     indices.data[index    ] = i;
@@ -75,6 +103,8 @@ fn push_quad_indices(i: i32, j: i32) {
     indices.data[index + 3] = i + 1;
     indices.data[index + 4] = j + 1;
     indices.data[index + 5] = j;
+
+    return index;
 }
 
 /// Compute the rays for the current- and mid-point of the segment list.

@@ -57,6 +57,8 @@ pub fn line_renderer(
     (LineSender { push_tx, pop_tx }, renderer)
 }
 
+const DEFAULT_BUFFER_SIZE: u64 = 32760;
+
 impl LineRenderer {
     /// Given a device, command queue and a texture to draw to, render the lines.
     pub fn render(
@@ -152,10 +154,22 @@ impl LineRenderer {
         let vertex_buf = create_buffer_with_intro(device, wgpu::BufferUsages::VERTEX, &[0]);
         let index_buf = create_buffer_with_intro(device, wgpu::BufferUsages::INDEX, &[0]);
 
-        // Load the shaders
+        // Common shader data
         let mut shader_loader = WgslLoader::new();
+
+        // Smaller between the default and max size, divided by the size of the command
+        let command_buf_size = device.limits().max_uniform_buffer_binding_size.min(32768) as u64;
+        // Split the buffer into two, one for vertices and indices each; divide out the
+        // size of each index; subtract one slot for the size indicator
+        let free_list_stack_size = (DEFAULT_BUFFER_SIZE / 8) - 1;
+
+        shader_loader.bind("COMMAND_BUF_SIZE", (command_buf_size / 16).to_string()); // Divide by size
+        shader_loader.bind("FREE_LIST_STACK_SIZE", free_list_stack_size.to_string());
         shader_loader.add_common_source(include_str!("common.wgsl"));
 
+        let free_list = create_buffer_with_intro(device, wgpu::BufferUsages::empty(), &[0]);
+
+        // Render shader
         let render_shader = shader_loader.create_shader(device, include_str!("draw_line.wgsl"));
 
         // Describe and create the render pipeline
@@ -203,10 +217,6 @@ impl LineRenderer {
             multiview: None,
         });
 
-        // Common compute shader data
-        let command_buf_size = device.limits().max_uniform_buffer_binding_size.min(32768) as u64;
-        shader_loader.bind("COMMAND_BUF_SIZE", (command_buf_size / 16).to_string()); // Divide by size
-
         // Describe and create the push pipeline
         let push_curve_shader =
             shader_loader.create_shader(device, include_str!("push_curve.wgsl"));
@@ -226,6 +236,7 @@ impl LineRenderer {
                 ComputePipelineBuffer::Storage(&vertex_buf),
                 ComputePipelineBuffer::Storage(&index_buf),
                 ComputePipelineBuffer::Storage(&curve_buf),
+                ComputePipelineBuffer::Storage(&free_list),
             ],
             push_curve_shader,
             "push_curve_main",
@@ -244,7 +255,9 @@ impl LineRenderer {
             &[
                 ComputePipelineBuffer::Uniform(&compute_pop_buf),
                 ComputePipelineBuffer::Storage(&vertex_buf),
+                ComputePipelineBuffer::Storage(&index_buf),
                 ComputePipelineBuffer::Storage(&curve_buf),
+                ComputePipelineBuffer::Storage(&free_list),
             ],
             shader_loader.create_shader(device, include_str!("pop_curve.wgsl")),
             "pop_curve_main",
@@ -279,8 +292,6 @@ impl LineSender {
         self.pop_tx.send(curve)
     }
 }
-
-const DEFAULT_BUFFER_SIZE: u64 = 32760;
 
 fn create_buffer_with_intro<T: bytemuck::Pod>(
     device: &wgpu::Device,

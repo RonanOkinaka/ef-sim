@@ -13,11 +13,14 @@ struct PopCommand {
 /// Vertex buffer.
 @group(0) @binding(1) var<storage, read_write> vertices: VertexBuffer;
 
-/// Array of active curves.
-@group(0) @binding(2) var<storage, read_write> curves: array<Curve>;
+/// Index buffer.
+@group(0) @binding(2) var<storage, read_write> indices: IndexBuffer;
 
-///
-@group(0) @binding(3) var<storage, read_write> free_list: array<Curve>;
+/// Array of active curves.
+@group(0) @binding(3) var<storage, read_write> curves: array<Curve>;
+
+/// Allocator free-list.
+@group(0) @binding(4) var<storage, read_write> free_list: TotalFreeList;
 
 
 @compute
@@ -46,6 +49,9 @@ fn pop_vertex(curve_index: u32) {
     } else {
         let next_vertex = vertices.data[next_index];
 
+        // This really does store the segment index
+        push_free_index(vertices.data[next_index + 1].next);
+
         var ray = vec2<f32>(0.0, 0.0);
         if (next_vertex.next >= 0) {
             // If we have 2+ vertices after us, update the central ray
@@ -66,7 +72,30 @@ fn pop_vertex(curve_index: u32) {
             vertices.data[next_index + 1].ray = -ray;
         }
     }
+    push_free_vertex(curve.tail_index);
     curve.tail_index = next_index;
 
     curves[curve_index] = curve;
+}
+
+fn push_free_vertex(index: i32) {
+    let slot = atomicAdd(&free_list.vertices.size, 1);
+
+    // If we get interrupted here, we're in trouble
+    free_list.vertices.data[slot] = index;
+    // But, WGPU should synchronize the dispatches to prevent it.
+}
+
+fn  push_free_index(index: i32) {
+    // Must be careful that another segment doesn't
+    // get drawn by this index set
+    indices.data[index    ] = 0;
+    indices.data[index + 1] = 0;
+    indices.data[index + 2] = 0;
+    indices.data[index + 3] = 0;
+    indices.data[index + 4] = 0;
+    indices.data[index + 5] = 0;
+
+    let slot = atomicAdd(&free_list.indices.size, 1);
+    free_list.indices.data[slot] = index;
 }

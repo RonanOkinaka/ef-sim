@@ -28,3 +28,15 @@ struct Curve {
     head_index: i32,
     tail_index: i32,
 }
+
+/// Flat free list for buffer pools.
+struct FreeList {
+    size: atomic<i32>,
+    data: array<i32, $$FREE_LIST_STACK_SIZE$$>,
+}
+
+/// Free lists for the vertex and index buffers.
+struct TotalFreeList {
+    vertices: FreeList,
+    indices: FreeList,
+}
