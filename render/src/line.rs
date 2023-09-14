@@ -1,6 +1,6 @@
 //! Define the type responsible for rendering lines.
 
-use bytemuck::{Pod, Zeroable};
+use bytemuck::{cast_slice_mut, Pod, Zeroable};
 use std::sync::mpsc;
 use util::math::Point;
 
@@ -8,6 +8,7 @@ use crate::compute_shader::*;
 use crate::shader::WgslLoader;
 
 /// State required for rendering lines.
+#[allow(dead_code)]
 pub struct LineRenderer {
     vertex_buf: wgpu::Buffer,
     index_buf: wgpu::Buffer,
@@ -21,7 +22,11 @@ pub struct LineRenderer {
 
     push_rx: mpsc::Receiver<(Point, u32)>,
     pop_rx: mpsc::Receiver<u32>,
-    num_indices: u64,
+
+    max_push_per_frame: u32,
+    max_pops_per_frame: u32,
+    max_num_points: u32,
+    max_num_curves: u32,
 }
 
 /// State required for requesting a line be rendered.
@@ -42,7 +47,6 @@ struct PushCommand {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct PopCommand {
     curve_index: u32,
-    _pad: [u32; 3],
 }
 
 pub fn line_renderer(
@@ -57,7 +61,15 @@ pub fn line_renderer(
     (LineSender { push_tx, pop_tx }, renderer)
 }
 
-const DEFAULT_BUFFER_SIZE: u64 = 32760;
+// This is arbitrary, 16MB right now
+const DEFAULT_BUFFER_SIZE: u32 = 16777216;
+
+const PUSH_COMMAND_SIZE: u32 = 16;
+const POP_COMMAND_SIZE: u32 = 4;
+const CURVE_SIZE: u32 = 8;
+const INDEX_SIZE: u32 = 4;
+const VERTEX_SIZE: u32 = 6 * 4;
+const QUAD_INDEX_SIZE: u32 = INDEX_SIZE * 6;
 
 impl LineRenderer {
     /// Given a device, command queue and a texture to draw to, render the lines.
@@ -87,14 +99,6 @@ impl LineRenderer {
                 bytemuck::cast_slice(push_commands.as_slice()),
             );
 
-            // TODO: temporary hack, this will be replaced with compute-driven
-            // indirect draws later
-            if self.num_indices == 1 {
-                self.num_indices = 0;
-            } else {
-                self.num_indices += 6 * push_commands.len() as u64;
-            }
-
             self.compute_push_curve
                 .run(&mut encoder, push_commands.len() as u32);
         }
@@ -102,10 +106,7 @@ impl LineRenderer {
         let pop_commands: Vec<PopCommand> = self
             .pop_rx
             .try_iter()
-            .map(|curve_index| PopCommand {
-                curve_index,
-                _pad: [0; 3],
-            })
+            .map(|curve_index| PopCommand { curve_index })
             .collect();
 
         if !pop_commands.is_empty() {
@@ -136,7 +137,7 @@ impl LineRenderer {
             pass.set_pipeline(&self.render_pipeline);
             pass.set_vertex_buffer(0, self.vertex_buf.slice(8..));
             pass.set_index_buffer(self.index_buf.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(2..(2 + self.num_indices as u32), 0, 0..1);
+            pass.draw_indexed(1..self.index_buf.size() as u32 / 4 - 1, 0, 0..1);
         }
 
         queue.submit(Some(encoder.finish()));
@@ -150,24 +151,56 @@ impl LineRenderer {
         push_rx: mpsc::Receiver<(Point, u32)>,
         pop_rx: mpsc::Receiver<u32>,
     ) -> Self {
+        // Smaller between the default and max size for a storage buffer
+        let default_buffer_size = device
+            .limits()
+            .max_storage_buffer_binding_size
+            .min(DEFAULT_BUFFER_SIZE);
+
         // Create the index and vertex buffers
-        let vertex_buf = create_buffer_with_intro(device, wgpu::BufferUsages::VERTEX, &[0]);
-        let index_buf = create_buffer_with_intro(device, wgpu::BufferUsages::INDEX, &[0]);
+        let vertex_buf =
+            create_buffer_with_size(device, wgpu::BufferUsages::VERTEX, default_buffer_size);
+        let index_buf =
+            create_buffer_with_size(device, wgpu::BufferUsages::INDEX, default_buffer_size);
 
         // Common shader data
         let mut shader_loader = WgslLoader::new();
 
-        // Smaller between the default and max size, divided by the size of the command
-        let command_buf_size = device.limits().max_uniform_buffer_binding_size.min(32768) as u64;
-        // Split the buffer into two, one for vertices and indices each; divide out the
-        // size of each index; subtract one slot for the size indicator
-        let free_list_stack_size = (DEFAULT_BUFFER_SIZE / 8) - 1;
+        // Divide out the size of each command
+        let max_push_per_frame = default_buffer_size / PUSH_COMMAND_SIZE;
+        let max_pops_per_frame = default_buffer_size / POP_COMMAND_SIZE;
 
-        shader_loader.bind("COMMAND_BUF_SIZE", (command_buf_size / 16).to_string()); // Divide by size
-        shader_loader.bind("FREE_LIST_STACK_SIZE", free_list_stack_size.to_string());
+        // The vertex + index free lists, and the curve structures, share space in one buffer
+        // The curves get one half
+        let curve_buf_size_bytes = default_buffer_size / 2;
+
+        // And each one is 8 bytes
+        let max_num_curves = curve_buf_size_bytes / CURVE_SIZE;
+
+        // Each free list gets one quarter (4), and each element is 4 bytes
+        // Also, subtract out the size indicator
+        let free_list_stack_size = (default_buffer_size / 4 / INDEX_SIZE) - 1;
+
+        shader_loader.bind("PUSH_BUF_LOGICAL_SIZE", max_push_per_frame.to_string());
+        shader_loader.bind("POP_BUF_LOGICAL_SIZE", max_pops_per_frame.to_string());
+        shader_loader.bind("CURVE_BUF_LOGICAL_SIZE", max_num_curves.to_string());
+        shader_loader.bind("FREE_LIST_LOGICAL_SIZE", free_list_stack_size.to_string());
         shader_loader.add_common_source(include_str!("common.wgsl"));
 
-        let free_list = create_buffer_with_intro(device, wgpu::BufferUsages::empty(), &[0]);
+        // Create the state buffer
+        let state_buf = create_buffer_with_size_mapped(
+            device,
+            wgpu::BufferUsages::COPY_DST,
+            default_buffer_size,
+            true,
+        );
+        {
+            let mut curve_slice = state_buf
+                .slice(..curve_buf_size_bytes as u64)
+                .get_mapped_range_mut();
+            cast_slice_mut(&mut curve_slice).fill(-1);
+        }
+        state_buf.unmap();
 
         // Render shader
         let render_shader = shader_loader.create_shader(device, include_str!("draw_line.wgsl"));
@@ -186,7 +219,7 @@ impl LineRenderer {
                 module: &render_shader,
                 entry_point: "vertex_main",
                 buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: 4 * 6, // 6 units of 4 bytes each (see below)
+                    array_stride: VERTEX_SIZE as u64,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &wgpu::vertex_attr_array![
                         0 => Float32x2,
@@ -221,46 +254,44 @@ impl LineRenderer {
         let push_curve_shader =
             shader_loader.create_shader(device, include_str!("push_curve.wgsl"));
 
-        let compute_push_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: command_buf_size,
-            mapped_at_creation: false,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::UNIFORM,
-        });
-        let curve_buf = create_buffer_with_intro(device, wgpu::BufferUsages::COPY_DST, &[-1; 10]);
+        let compute_push_buf =
+            create_buffer_with_size(device, wgpu::BufferUsages::COPY_DST, default_buffer_size);
 
         let compute_push_curve = ComputePipeline::new(
             device,
             &[
-                ComputePipelineBuffer::Uniform(&compute_push_buf),
+                ComputePipelineBuffer::Storage(&compute_push_buf),
                 ComputePipelineBuffer::Storage(&vertex_buf),
                 ComputePipelineBuffer::Storage(&index_buf),
-                ComputePipelineBuffer::Storage(&curve_buf),
-                ComputePipelineBuffer::Storage(&free_list),
+                ComputePipelineBuffer::Storage(&state_buf),
             ],
             push_curve_shader,
             "push_curve_main",
         );
 
         // Describe and create the pop pipeline
-        let compute_pop_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: command_buf_size,
-            mapped_at_creation: false,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::UNIFORM,
-        });
+        let compute_pop_buf =
+            create_buffer_with_size(device, wgpu::BufferUsages::COPY_DST, default_buffer_size);
 
         let compute_pop_curve = ComputePipeline::new(
             device,
             &[
-                ComputePipelineBuffer::Uniform(&compute_pop_buf),
+                ComputePipelineBuffer::Storage(&compute_pop_buf),
                 ComputePipelineBuffer::Storage(&vertex_buf),
                 ComputePipelineBuffer::Storage(&index_buf),
-                ComputePipelineBuffer::Storage(&curve_buf),
-                ComputePipelineBuffer::Storage(&free_list),
+                ComputePipelineBuffer::Storage(&state_buf),
             ],
             shader_loader.create_shader(device, include_str!("pop_curve.wgsl")),
             "pop_curve_main",
+        );
+
+        let max_num_points = free_list_stack_size // No more points than positions in free list
+            .min(vertex_buf.size() as u32 / 2 / VERTEX_SIZE - 1) // One point is represented by 2 vertices
+            .min(index_buf.size() as u32 / QUAD_INDEX_SIZE - 1); // One quad set is 6x 4-byte integers
+
+        println!(
+            "max push: {}\nmax pops: {}\nmax points: {}\nmax curves: {}",
+            max_push_per_frame, max_pops_per_frame, max_num_points, max_num_curves
         );
 
         Self {
@@ -273,7 +304,10 @@ impl LineRenderer {
             compute_pop_curve,
             push_rx,
             pop_rx,
-            num_indices: 1,
+            max_push_per_frame,
+            max_pops_per_frame,
+            max_num_points,
+            max_num_curves,
         }
     }
 }
@@ -293,24 +327,24 @@ impl LineSender {
     }
 }
 
-fn create_buffer_with_intro<T: bytemuck::Pod>(
+fn create_buffer_with_size_mapped(
     device: &wgpu::Device,
     usage: wgpu::BufferUsages,
-    intro_slice: &[T],
+    size: u32,
+    mapped_at_creation: bool,
 ) -> wgpu::Buffer {
-    let byte_slice: &[u8] = bytemuck::cast_slice(intro_slice);
-    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+    device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
-        size: DEFAULT_BUFFER_SIZE,
-        mapped_at_creation: true,
+        size: size as u64,
+        mapped_at_creation,
         usage: usage | wgpu::BufferUsages::STORAGE,
-    });
+    })
+}
 
-    buffer
-        .slice(0..byte_slice.len() as u64)
-        .get_mapped_range_mut()
-        .copy_from_slice(byte_slice);
-    buffer.unmap();
-
-    buffer
+fn create_buffer_with_size(
+    device: &wgpu::Device,
+    usage: wgpu::BufferUsages,
+    size: u32,
+) -> wgpu::Buffer {
+    create_buffer_with_size_mapped(device, usage, size, false)
 }

@@ -9,7 +9,7 @@ struct PushCommand {
 
 
 /// Data required to push a point.
-@group(0) @binding(0) var<uniform> commands: array<PushCommand, $$COMMAND_BUF_SIZE$$>;
+@group(0) @binding(0) var<storage, read> commands: array<PushCommand, $$PUSH_BUF_LOGICAL_SIZE$$>;
 
 /// Vertex buffer.
 @group(0) @binding(1) var<storage, read_write> vertices: VertexBuffer;
@@ -17,11 +17,8 @@ struct PushCommand {
 /// Index buffer.
 @group(0) @binding(2) var<storage, read_write> indices: IndexBuffer;
 
-/// Array of active curves.
-@group(0) @binding(3) var<storage, read_write> curves: array<Curve>;
-
-/// Allocator free-list.
-@group(0) @binding(4) var<storage, read_write> free_list: TotalFreeList;
+/// Shader state.
+@group(0) @binding(3) var<storage, read_write> state: ComputeState;
 
 
 @compute
@@ -38,7 +35,7 @@ fn push_curve_main(@builtin(global_invocation_id) global_invocation_id: vec3<u32
 ///  - Six indices (one quad)
 ///  - The midpoint for a curve that has 2+ points
 fn push_vertex(pos: vec2<f32>, curve_index: u32) {
-    var curve = curves[curve_index];
+    var curve = state.curves[curve_index];
     let vertex_index = allocate_vertices();
 
     var index_index = -1;
@@ -65,29 +62,29 @@ fn push_vertex(pos: vec2<f32>, curve_index: u32) {
     vertices.data[vertex_index + 1] = Vertex(pos, -new_ray, 1.0, index_index);
 
     curve.head_index = vertex_index;
-    curves[curve_index] = curve;
+    state.curves[curve_index] = curve;
 }
 
 /// Allocate space for two vertices.
 fn allocate_vertices() -> i32 {
-    let size = atomicSub(&free_list.vertices.size, 1);
+    let size = atomicSub(&state.vert_free.size, 1);
     if (size <= 0) {
-        atomicAdd(&free_list.vertices.size, 1);
+        atomicAdd(&state.vert_free.size, 1);
         return atomicAdd(&vertices.size, 2);
     }
 
-    return free_list.vertices.data[size - 1];
+    return state.vert_free.data[size - 1];
 }
 
 /// Allocate space for six indices.
 fn allocate_indices() -> i32 {
-    let size = atomicSub(&free_list.indices.size, 1);
+    let size = atomicSub(&state.indx_free.size, 1);
     if (size <= 0) {
-        atomicAdd(&free_list.indices.size, 1);
+        atomicAdd(&state.indx_free.size, 1);
         return atomicAdd(&indices.size, 6);
     }
 
-    return free_list.indices.data[size - 1];
+    return state.indx_free.data[size - 1];
 }
 
 /// Place the 6 indices (one quad) into the index buffer.

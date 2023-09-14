@@ -2,13 +2,12 @@
 
 /// Temporary way for CPU to communicate with this shader.
 struct PopCommand {
-    // Must be stride 16...
-    curve_index: vec4<u32>,
+    curve_index: u32,
 }
 
 
 /// Data required to pop a point.
-@group(0) @binding(0) var<uniform> commands: array<PopCommand, $$COMMAND_BUF_SIZE$$>;
+@group(0) @binding(0) var<storage, read> commands: array<PopCommand, $$POP_BUF_LOGICAL_SIZE$$>;
 
 /// Vertex buffer.
 @group(0) @binding(1) var<storage, read_write> vertices: VertexBuffer;
@@ -16,22 +15,19 @@ struct PopCommand {
 /// Index buffer.
 @group(0) @binding(2) var<storage, read_write> indices: IndexBuffer;
 
-/// Array of active curves.
-@group(0) @binding(3) var<storage, read_write> curves: array<Curve>;
-
-/// Allocator free-list.
-@group(0) @binding(4) var<storage, read_write> free_list: TotalFreeList;
+/// Shader state.
+@group(0) @binding(3) var<storage, read_write> state: ComputeState;
 
 
 @compute
 @workgroup_size(1) // TODO: Update to better value!
 fn pop_curve_main(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
-    pop_vertex(commands[global_invocation_id.x].curve_index.x);
+    pop_vertex(commands[global_invocation_id.x].curve_index);
 }
 
 /// Pop a point off the back of a curve.
 fn pop_vertex(curve_index: u32) {
-    var curve = curves[curve_index];
+    var curve = state.curves[curve_index];
 
     // If we have no points, do nothing
     if (curve.tail_index < 0) {
@@ -75,14 +71,14 @@ fn pop_vertex(curve_index: u32) {
     push_free_vertex(curve.tail_index);
     curve.tail_index = next_index;
 
-    curves[curve_index] = curve;
+    state.curves[curve_index] = curve;
 }
 
 fn push_free_vertex(index: i32) {
-    let slot = atomicAdd(&free_list.vertices.size, 1);
+    let slot = atomicAdd(&state.vert_free.size, 1);
 
     // If we get interrupted here, we're in trouble
-    free_list.vertices.data[slot] = index;
+    state.vert_free.data[slot] = index;
     // But, WGPU should synchronize the dispatches to prevent it.
 }
 
@@ -96,6 +92,6 @@ fn  push_free_index(index: i32) {
     indices.data[index + 4] = 0;
     indices.data[index + 5] = 0;
 
-    let slot = atomicAdd(&free_list.indices.size, 1);
-    free_list.indices.data[slot] = index;
+    let slot = atomicAdd(&state.indx_free.size, 1);
+    state.indx_free.data[slot] = index;
 }

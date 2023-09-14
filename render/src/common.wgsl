@@ -18,7 +18,6 @@ struct VertexBuffer {
 /// Structure of the index buffer, which includes its size.
 struct IndexBuffer {
     size: atomic<i32>,
-    _pad: u32,
     data: array<i32>,
 }
 
@@ -32,11 +31,12 @@ struct Curve {
 /// Flat free list for buffer pools.
 struct FreeList {
     size: atomic<i32>,
-    data: array<i32, $$FREE_LIST_STACK_SIZE$$>,
+    data: array<i32, $$FREE_LIST_LOGICAL_SIZE$$>,
 }
 
-/// Free lists for the vertex and index buffers.
-struct TotalFreeList {
-    vertices: FreeList,
-    indices: FreeList,
+/// Stores our higher-level logical constructs.
+struct ComputeState {
+    curves: array<Curve, $$CURVE_BUF_LOGICAL_SIZE$$>,
+    vert_free: FreeList,
+    indx_free: FreeList,
 }

@@ -6,6 +6,7 @@ pub struct ComputePipeline {
 }
 
 pub enum ComputePipelineBuffer<'a> {
+    #[allow(dead_code)]
     Uniform(&'a wgpu::Buffer),
     Storage(&'a wgpu::Buffer),
 }
