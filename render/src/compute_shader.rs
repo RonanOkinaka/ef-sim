@@ -3,6 +3,7 @@
 pub struct ComputePipeline {
     pipeline: wgpu::ComputePipeline,
     bind_group: wgpu::BindGroup,
+    workgroup_size_x: u32,
 }
 
 pub enum ComputePipelineBuffer<'a> {
@@ -17,6 +18,7 @@ impl ComputePipeline {
         buffers: &[ComputePipelineBuffer],
         shader: wgpu::ShaderModule,
         entry_point: &str,
+        workgroup_size_x: u32,
     ) -> Self {
         let uniform_binding = wgpu::BindingType::Buffer {
             ty: wgpu::BufferBindingType::Uniform,
@@ -94,13 +96,17 @@ impl ComputePipeline {
         Self {
             pipeline,
             bind_group,
+            workgroup_size_x,
         }
     }
 
-    pub fn run(&self, encoder: &mut wgpu::CommandEncoder, work_groups: u32) {
+    pub fn run(&self, encoder: &mut wgpu::CommandEncoder, invocations: u32) {
+        // Round up the number of workgroups
+        let num_work_groups = (invocations + self.workgroup_size_x - 1) / self.workgroup_size_x;
+
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
-        pass.dispatch_workgroups(work_groups, 1, 1);
+        pass.dispatch_workgroups(num_work_groups, 1, 1);
     }
 }

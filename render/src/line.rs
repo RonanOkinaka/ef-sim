@@ -65,7 +65,9 @@ pub fn line_renderer(
 const DEFAULT_BUFFER_SIZE: u32 = 16777216;
 
 const PUSH_COMMAND_SIZE: u32 = 16;
+const PUSH_COMMAND_ALIGN: u32 = 8;
 const POP_COMMAND_SIZE: u32 = 4;
+const POP_COMMAND_ALIGN: u32 = 4;
 const CURVE_SIZE: u32 = 8;
 const INDEX_SIZE: u32 = 4;
 const VERTEX_SIZE: u32 = 6 * 4;
@@ -96,6 +98,11 @@ impl LineRenderer {
             queue.write_buffer(
                 &self.compute_push_buf,
                 0,
+                bytemuck::cast_slice(&[push_commands.len() as u32]),
+            );
+            queue.write_buffer(
+                &self.compute_push_buf,
+                PUSH_COMMAND_ALIGN.into(),
                 bytemuck::cast_slice(push_commands.as_slice()),
             );
 
@@ -113,6 +120,11 @@ impl LineRenderer {
             queue.write_buffer(
                 &self.compute_pop_buf,
                 0,
+                bytemuck::cast_slice(&[pop_commands.len() as u32]),
+            );
+            queue.write_buffer(
+                &self.compute_pop_buf,
+                POP_COMMAND_ALIGN.into(),
                 bytemuck::cast_slice(pop_commands.as_slice()),
             );
 
@@ -166,9 +178,9 @@ impl LineRenderer {
         // Common shader data
         let mut shader_loader = WgslLoader::new();
 
-        // Divide out the size of each command
-        let max_push_per_frame = default_buffer_size / PUSH_COMMAND_SIZE;
-        let max_pops_per_frame = default_buffer_size / POP_COMMAND_SIZE;
+        // Divide out the size of each command; subtract one for size indicator
+        let max_push_per_frame = default_buffer_size / PUSH_COMMAND_SIZE - 1;
+        let max_pops_per_frame = default_buffer_size / POP_COMMAND_SIZE - 1;
 
         // The vertex + index free lists, and the curve structures, share space in one buffer
         // The curves get one half
@@ -250,12 +262,16 @@ impl LineRenderer {
             multiview: None,
         });
 
-        // Describe and create the push pipeline
-        let push_curve_shader =
-            shader_loader.create_shader(device, include_str!("push_curve.wgsl"));
+        // General compute data
+        let workgroup_size_x = 256;
+        shader_loader.bind("WORKGROUP_SIZE_X", workgroup_size_x.to_string());
 
         let compute_push_buf =
             create_buffer_with_size(device, wgpu::BufferUsages::COPY_DST, default_buffer_size);
+
+        // Describe and create the push pipeline
+        let push_curve_shader =
+            shader_loader.create_shader(device, include_str!("push_curve.wgsl"));
 
         let compute_push_curve = ComputePipeline::new(
             device,
@@ -267,6 +283,7 @@ impl LineRenderer {
             ],
             push_curve_shader,
             "push_curve_main",
+            workgroup_size_x,
         );
 
         // Describe and create the pop pipeline
@@ -283,6 +300,7 @@ impl LineRenderer {
             ],
             shader_loader.create_shader(device, include_str!("pop_curve.wgsl")),
             "pop_curve_main",
+            workgroup_size_x,
         );
 
         let max_num_points = free_list_stack_size // No more points than positions in free list

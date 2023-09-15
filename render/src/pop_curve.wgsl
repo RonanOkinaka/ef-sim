@@ -5,9 +5,14 @@ struct PopCommand {
     curve_index: u32,
 }
 
+struct PopCommandBuffer {
+    size: u32,
+    data: array<PopCommand, $$POP_BUF_LOGICAL_SIZE$$>,
+}
+
 
 /// Data required to pop a point.
-@group(0) @binding(0) var<storage, read> commands: array<PopCommand, $$POP_BUF_LOGICAL_SIZE$$>;
+@group(0) @binding(0) var<storage, read> commands: PopCommandBuffer;
 
 /// Vertex buffer.
 @group(0) @binding(1) var<storage, read_write> vertices: VertexBuffer;
@@ -20,9 +25,13 @@ struct PopCommand {
 
 
 @compute
-@workgroup_size(1) // TODO: Update to better value!
+@workgroup_size($$WORKGROUP_SIZE_X$$)
 fn pop_curve_main(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
-    pop_vertex(commands[global_invocation_id.x].curve_index);
+    if (global_invocation_id.x >= commands.size) {
+        return;
+    }
+
+    pop_vertex(commands.data[global_invocation_id.x].curve_index);
 }
 
 /// Pop a point off the back of a curve.
