@@ -1,6 +1,7 @@
 //! Define the type responsible for rendering lines.
 
 use bytemuck::{cast_slice_mut, Pod, Zeroable};
+use std::collections::HashMap;
 use std::sync::mpsc;
 use util::math::Point;
 
@@ -30,6 +31,7 @@ pub struct LineRenderer {
 }
 
 /// State required for requesting a line be rendered.
+#[derive(Clone)]
 pub struct LineSender {
     push_tx: mpsc::Sender<(Point, u32)>,
     pop_tx: mpsc::Sender<u32>,
@@ -84,52 +86,47 @@ impl LineRenderer {
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
-        let push_commands: Vec<PushCommand> = self
-            .push_rx
-            .try_iter()
-            .map(|(pos, curve_index)| PushCommand {
-                pos,
+        let push_commands_iter = self.push_rx.try_iter().map(|(pos, curve_index)| {
+            (
                 curve_index,
-                _pad: 0,
-            })
-            .collect();
+                PushCommand {
+                    pos,
+                    curve_index,
+                    _pad: 0,
+                },
+            )
+        });
+        // TODO: Handle this intelligently, as this can easily livelock and/or overrun the vertex
+        // buffer right now.
+        // (This is on the backburner because particle updates are intended to come from the GPU.)
+        for push_pass in partition_curve_updates(push_commands_iter, self.max_push_per_frame) {
+            let len = push_pass.len() as u32;
 
-        if !push_commands.is_empty() {
-            queue.write_buffer(
-                &self.compute_push_buf,
-                0,
-                bytemuck::cast_slice(&[push_commands.len() as u32]),
-            );
+            queue.write_buffer(&self.compute_push_buf, 0, bytemuck::cast_slice(&[len]));
             queue.write_buffer(
                 &self.compute_push_buf,
                 PUSH_COMMAND_ALIGN.into(),
-                bytemuck::cast_slice(push_commands.as_slice()),
+                bytemuck::cast_slice(push_pass.as_slice()),
             );
 
-            self.compute_push_curve
-                .run(&mut encoder, push_commands.len() as u32);
+            self.compute_push_curve.run(&mut encoder, len);
         }
 
-        let pop_commands: Vec<PopCommand> = self
+        let pop_commands_iter = self
             .pop_rx
             .try_iter()
-            .map(|curve_index| PopCommand { curve_index })
-            .collect();
+            .map(|curve_index| (curve_index, PopCommand { curve_index }));
+        for pop_pass in partition_curve_updates(pop_commands_iter, self.max_pops_per_frame) {
+            let len = pop_pass.len() as u32;
 
-        if !pop_commands.is_empty() {
-            queue.write_buffer(
-                &self.compute_pop_buf,
-                0,
-                bytemuck::cast_slice(&[pop_commands.len() as u32]),
-            );
+            queue.write_buffer(&self.compute_pop_buf, 0, bytemuck::cast_slice(&[len]));
             queue.write_buffer(
                 &self.compute_pop_buf,
                 POP_COMMAND_ALIGN.into(),
-                bytemuck::cast_slice(pop_commands.as_slice()),
+                bytemuck::cast_slice(pop_pass.as_slice()),
             );
 
-            self.compute_pop_curve
-                .run(&mut encoder, pop_commands.len() as u32);
+            self.compute_pop_curve.run(&mut encoder, len);
         }
 
         {
@@ -365,4 +362,36 @@ fn create_buffer_with_size(
     size: u32,
 ) -> wgpu::Buffer {
     create_buffer_with_size_mapped(device, usage, size, false)
+}
+
+/// In order of arrival, partition curve updates such that
+/// one curve is not more than once per pass, and the number
+/// of updates does not surpass the command buffer size.
+fn partition_curve_updates<T, I>(iter: I, limit: u32) -> Vec<Vec<T>>
+where
+    I: Iterator<Item = (u32, T)>,
+{
+    let limit = limit as usize;
+    let mut ret = Vec::<Vec<_>>::new();
+    let mut gen_map = HashMap::<u32, i32>::new();
+    let mut first_not_full = 0;
+    let mut len = 0;
+
+    for (curve, value) in iter {
+        let gen = gen_map.entry(curve).or_insert(-1);
+        *gen = first_not_full.max(*gen + 1);
+
+        let gen = *gen as usize;
+        if gen >= len {
+            ret.push(Vec::new());
+            len += 1;
+        }
+
+        ret[gen].push(value);
+        if ret[gen].len() == limit {
+            first_not_full += 1;
+        }
+    }
+
+    ret
 }
