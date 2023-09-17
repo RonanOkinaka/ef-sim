@@ -90,7 +90,7 @@ fn allocate_indices() -> i32 {
     let size = atomicSub(&state.indx_free.size, 1);
     if (size <= 0) {
         atomicAdd(&state.indx_free.size, 1);
-        return atomicAdd(&indices.size, 6);
+        return atomicAdd(&state.draw.num_indices, 6);
     }
 
     return state.indx_free.data[size - 1];

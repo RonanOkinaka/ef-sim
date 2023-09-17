@@ -14,6 +14,7 @@ pub struct LineRenderer {
     vertex_buf: wgpu::Buffer,
     index_buf: wgpu::Buffer,
     render_pipeline: wgpu::RenderPipeline,
+    render_bundle: wgpu::RenderBundle,
 
     compute_push_buf: wgpu::Buffer,
     compute_push_curve: ComputePipeline,
@@ -74,6 +75,7 @@ const CURVE_SIZE: u32 = 8;
 const INDEX_SIZE: u32 = 4;
 const VERTEX_SIZE: u32 = 6 * 4;
 const QUAD_INDEX_SIZE: u32 = INDEX_SIZE * 6;
+const INDIRECT_DRAW_SIZE: u32 = 6 * 4;
 
 impl LineRenderer {
     /// Given a device, command queue and a texture to draw to, render the lines.
@@ -143,10 +145,7 @@ impl LineRenderer {
                 depth_stencil_attachment: None,
             });
 
-            pass.set_pipeline(&self.render_pipeline);
-            pass.set_vertex_buffer(0, self.vertex_buf.slice(8..));
-            pass.set_index_buffer(self.index_buf.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(1..self.index_buf.size() as u32 / 4 - 1, 0, 0..1);
+            pass.execute_bundles([&self.render_bundle]);
         }
 
         queue.submit(Some(encoder.finish()));
@@ -180,8 +179,8 @@ impl LineRenderer {
         let max_pops_per_frame = default_buffer_size / POP_COMMAND_SIZE - 1;
 
         // The vertex + index free lists, and the curve structures, share space in one buffer
-        // The curves get one half
-        let curve_buf_size_bytes = default_buffer_size / 2;
+        // The curves get one half [without the indirect draw buffer]
+        let curve_buf_size_bytes = (default_buffer_size) / 2 - INDIRECT_DRAW_SIZE;
 
         // And each one is 8 bytes
         let max_num_curves = curve_buf_size_bytes / CURVE_SIZE;
@@ -199,13 +198,25 @@ impl LineRenderer {
         // Create the state buffer
         let state_buf = create_buffer_with_size_mapped(
             device,
-            wgpu::BufferUsages::COPY_DST,
+            wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::INDIRECT,
             default_buffer_size,
             true,
         );
         {
             let mut curve_slice = state_buf
-                .slice(..curve_buf_size_bytes as u64)
+                .slice(..(INDIRECT_DRAW_SIZE as u64))
+                .get_mapped_range_mut();
+            cast_slice_mut(&mut curve_slice).copy_from_slice(bytemuck::cast_slice::<u32, u8>(&[
+                0, // # indices
+                1, // # instances (1, always)
+                0, // Index buffer offset
+                0, // Vertex buffer offset
+                0, // Instance offset
+                0, // Pad
+            ]));
+
+            let mut curve_slice = state_buf
+                .slice((INDIRECT_DRAW_SIZE as u64)..(curve_buf_size_bytes as u64))
                 .get_mapped_range_mut();
             cast_slice_mut(&mut curve_slice).fill(-1);
         }
@@ -258,6 +269,24 @@ impl LineRenderer {
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
         });
+
+        // Create the render bundle
+        let mut render_bundle_encoder =
+            device.create_render_bundle_encoder(&wgpu::RenderBundleEncoderDescriptor {
+                label: None,
+                color_formats: &[Some(surface.get_capabilities(adapter).formats[0])],
+                depth_stencil: None,
+                sample_count: wgpu::MultisampleState::default().count,
+                multiview: None,
+            });
+
+        render_bundle_encoder.set_pipeline(&render_pipeline);
+        render_bundle_encoder.set_vertex_buffer(0, vertex_buf.slice(8..));
+        render_bundle_encoder.set_index_buffer(index_buf.slice(..), wgpu::IndexFormat::Uint32);
+        render_bundle_encoder.draw_indexed_indirect(&state_buf, 0);
+
+        let render_bundle =
+            render_bundle_encoder.finish(&wgpu::RenderBundleDescriptor { label: None });
 
         // General compute data
         let workgroup_size_x = 256;
@@ -313,6 +342,7 @@ impl LineRenderer {
             vertex_buf,
             index_buf,
             render_pipeline,
+            render_bundle,
             compute_push_buf,
             compute_push_curve,
             compute_pop_buf,

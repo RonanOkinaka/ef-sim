@@ -15,9 +15,9 @@ struct VertexBuffer {
     data: array<Vertex>,
 }
 
-/// Structure of the index buffer, which includes its size.
+/// Structure of the index buffer, which _doesn't_ include its size
+/// (which lives in IndirectIndexedDraw now)
 struct IndexBuffer {
-    size: atomic<i32>,
     data: array<i32>,
 }
 
@@ -34,8 +34,21 @@ struct FreeList {
     data: array<i32, $$FREE_LIST_LOGICAL_SIZE$$>,
 }
 
+/// Indirect draw data.
+struct IndirectIndexedDraw {
+    num_indices: atomic<i32>,
+
+    // We won't actually write any of the below!
+    num_insts: u32,
+    indx_offset: u32,
+    vert_offset: u32,
+    inst_offset: u32,
+    _pad: u32,
+}
+
 /// Stores our higher-level logical constructs.
 struct ComputeState {
+    draw: IndirectIndexedDraw,
     curves: array<Curve, $$CURVE_BUF_LOGICAL_SIZE$$>,
     vert_free: FreeList,
     indx_free: FreeList,
