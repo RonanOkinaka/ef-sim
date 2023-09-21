@@ -16,6 +16,9 @@ pub struct LineRenderer {
     render_pipeline: wgpu::RenderPipeline,
     render_bundle: wgpu::RenderBundle,
 
+    charge_buf: wgpu::Buffer,
+    compute_particle: ComputePipeline,
+
     compute_push_buf: wgpu::Buffer,
     compute_push_curve: ComputePipeline,
 
@@ -29,6 +32,7 @@ pub struct LineRenderer {
     max_pops_per_frame: u32,
     max_num_points: u32,
     max_num_curves: u32,
+    max_num_charges: u32,
 }
 
 /// State required for requesting a line be rendered.
@@ -76,6 +80,7 @@ const INDEX_SIZE: u32 = 4;
 const VERTEX_SIZE: u32 = 6 * 4;
 const QUAD_INDEX_SIZE: u32 = INDEX_SIZE * 6;
 const INDIRECT_DRAW_SIZE: u32 = 6 * 4;
+const CHARGE_SIZE: u32 = 4 * 4;
 
 impl LineRenderer {
     /// Given a device, command queue and a texture to draw to, render the lines.
@@ -98,10 +103,17 @@ impl LineRenderer {
                 },
             )
         });
-        // TODO: Handle this intelligently, as this can easily livelock and/or overrun the vertex
-        // buffer right now.
-        // (This is on the backburner because particle updates are intended to come from the GPU.)
-        for push_pass in partition_curve_updates(push_commands_iter, self.max_push_per_frame) {
+
+        let push_commands = partition_curve_updates(push_commands_iter, self.max_push_per_frame);
+
+        if push_commands.is_empty() {
+            // Reset the pop buffer
+            queue.write_buffer(&self.compute_pop_buf, 0, &[0; POP_COMMAND_ALIGN as usize]);
+
+            self.compute_particle.run(&mut encoder, 1);
+        }
+
+        for push_pass in push_commands {
             let len = push_pass.len() as u32;
 
             queue.write_buffer(&self.compute_push_buf, 0, bytemuck::cast_slice(&[len]));
@@ -112,23 +124,6 @@ impl LineRenderer {
             );
 
             self.compute_push_curve.run(&mut encoder, len);
-        }
-
-        let pop_commands_iter = self
-            .pop_rx
-            .try_iter()
-            .map(|curve_index| (curve_index, PopCommand { curve_index }));
-        for pop_pass in partition_curve_updates(pop_commands_iter, self.max_pops_per_frame) {
-            let len = pop_pass.len() as u32;
-
-            queue.write_buffer(&self.compute_pop_buf, 0, bytemuck::cast_slice(&[len]));
-            queue.write_buffer(
-                &self.compute_pop_buf,
-                POP_COMMAND_ALIGN.into(),
-                bytemuck::cast_slice(pop_pass.as_slice()),
-            );
-
-            self.compute_pop_curve.run(&mut encoder, len);
         }
 
         {
@@ -189,11 +184,21 @@ impl LineRenderer {
         // Also, subtract out the size indicator
         let free_list_stack_size = (default_buffer_size / 4 / INDEX_SIZE) - 1;
 
+        // Charge buffer size
+        let charge_buf_size_bytes = device.limits().max_uniform_buffer_binding_size.min(16384);
+        let max_num_charges = charge_buf_size_bytes / CHARGE_SIZE;
+
         shader_loader.bind("PUSH_BUF_LOGICAL_SIZE", max_push_per_frame.to_string());
         shader_loader.bind("POP_BUF_LOGICAL_SIZE", max_pops_per_frame.to_string());
         shader_loader.bind("CURVE_BUF_LOGICAL_SIZE", max_num_curves.to_string());
         shader_loader.bind("FREE_LIST_LOGICAL_SIZE", free_list_stack_size.to_string());
+        shader_loader.bind("CHARGE_BUF_LOGICAL_SIZE", max_num_charges.to_string());
+
         shader_loader.add_common_source(include_str!("common.wgsl"));
+        shader_loader.bind(
+            "INCLUDE_PUSH_COMMON_WGSL",
+            include_str!("push_common.wgsl").to_owned(),
+        );
 
         // Create the state buffer
         let state_buf = create_buffer_with_size_mapped(
@@ -212,7 +217,7 @@ impl LineRenderer {
                 0, // Index buffer offset
                 0, // Vertex buffer offset
                 0, // Instance offset
-                0, // Pad
+                1, // Curve buffer size
             ]));
 
             let mut curve_slice = state_buf
@@ -292,10 +297,10 @@ impl LineRenderer {
         let workgroup_size_x = 256;
         shader_loader.bind("WORKGROUP_SIZE_X", workgroup_size_x.to_string());
 
+        // Describe and create the push pipeline
         let compute_push_buf =
             create_buffer_with_size(device, wgpu::BufferUsages::COPY_DST, default_buffer_size);
 
-        // Describe and create the push pipeline
         let push_curve_shader =
             shader_loader.create_shader(device, include_str!("push_curve.wgsl"));
 
@@ -338,11 +343,37 @@ impl LineRenderer {
             max_push_per_frame, max_pops_per_frame, max_num_points, max_num_curves
         );
 
+        // Create the particle compute pipeline
+        let charge_buf = create_buffer_with_size(
+            device,
+            wgpu::BufferUsages::UNIFORM,
+            device.limits().max_uniform_buffer_binding_size,
+        );
+
+        let compute_particle_shader =
+            shader_loader.create_shader(device, include_str!("particle.wgsl"));
+
+        let compute_particle = ComputePipeline::new(
+            device,
+            &[
+                ComputePipelineBuffer::Storage(&state_buf),
+                ComputePipelineBuffer::Uniform(&charge_buf),
+                ComputePipelineBuffer::Storage(&compute_pop_buf),
+                ComputePipelineBuffer::Storage(&vertex_buf),
+                ComputePipelineBuffer::Storage(&index_buf),
+            ],
+            compute_particle_shader,
+            "particle_main",
+            workgroup_size_x,
+        );
+
         Self {
             vertex_buf,
             index_buf,
             render_pipeline,
             render_bundle,
+            charge_buf,
+            compute_particle,
             compute_push_buf,
             compute_push_curve,
             compute_pop_buf,
@@ -353,6 +384,7 @@ impl LineRenderer {
             max_pops_per_frame,
             max_num_points,
             max_num_curves,
+            max_num_charges,
         }
     }
 }

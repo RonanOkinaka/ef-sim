@@ -60,7 +60,6 @@ async fn run_async() -> ! {
     surface.configure(&device, &config);
 
     let (sender, mut renderer) = line_renderer(&device, &adapter, &surface);
-    let mut curve_index = 0;
 
     window.run(
         move || {
@@ -76,33 +75,17 @@ async fn run_async() -> ! {
             curr_frame.present();
         },
         move |input_event| {
-            match input_event.reason {
-                InputEventType::MouseLeft => {
-                    let cursor = input_event.cursor;
-                    if cursor.left_down {
-                        let pos = Point(cursor.x * mx - 1.0, 1.0 - cursor.y * my);
-                        sender
-                            .push_point(pos, curve_index)
-                            .expect("Render thread should never hang up");
-                    }
+            if let InputEvent {
+                reason: InputEventType::MouseLeft,
+                cursor,
+            } = input_event
+            {
+                if cursor.left_down {
+                    let pos = Point(cursor.x * mx - 1.0, 1.0 - cursor.y * my);
+                    sender
+                        .push_point(pos, 0)
+                        .expect("Render thread should never hang up");
                 }
-                InputEventType::KeyboardButton(true, key) => {
-                    match key {
-                        // TODO: This could probably be a map and a macro...
-                        VirtualKeyCode::Key1 => curve_index = 0,
-                        VirtualKeyCode::Key2 => curve_index = 1,
-                        VirtualKeyCode::Key3 => curve_index = 2,
-                        VirtualKeyCode::Key4 => curve_index = 3,
-                        VirtualKeyCode::Key5 => curve_index = 4,
-                        VirtualKeyCode::Space => {
-                            sender
-                                .pop_point(curve_index)
-                                .expect("Render thread should never hang up");
-                        }
-                        _ => {}
-                    }
-                }
-                _ => {}
             }
         },
     );
