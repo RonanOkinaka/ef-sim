@@ -3,7 +3,8 @@
 /// Stores charge data.
 struct Charge {
     pos: vec2<f32>,
-    _pad: vec2<u32>,
+    charge: f32,
+    _pad: u32,
 }
 
 struct ChargeBuffer {
@@ -47,7 +48,15 @@ fn particle_main(@builtin(global_invocation_id) global_invocation_id: vec3<u32>)
     var pos = vertices.data[head_index].pos;
 
     // Calculate our next value
-    pos += vec2<f32>(0.01, 0.0);
+    var ds = vec2<f32>(0.0, 0.0);
+    for (var i: i32; i < charges.size.x; i += 1) {
+        let ray = pos - charges.data[i].pos;
+        var mag = length(ray);
+        mag *= mag;
+
+        ds += charges.data[i].charge * ray / mag;
+    }
+    pos += normalize(ds) * 0.01;
 
     // We'll push here instead of dispatching another shader for it
     let num_points = push_vertex(pos, curve_index);

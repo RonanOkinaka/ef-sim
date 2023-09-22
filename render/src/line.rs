@@ -10,12 +10,13 @@ use crate::shader::WgslLoader;
 
 /// State required for rendering lines.
 #[allow(dead_code)]
-pub struct LineRenderer {
+pub struct ParticleRenderer {
     vertex_buf: wgpu::Buffer,
     index_buf: wgpu::Buffer,
     render_pipeline: wgpu::RenderPipeline,
     render_bundle: wgpu::RenderBundle,
 
+    num_charges: u32,
     charge_buf: wgpu::Buffer,
     compute_particle: ComputePipeline,
 
@@ -25,6 +26,7 @@ pub struct LineRenderer {
     compute_pop_buf: wgpu::Buffer,
     compute_pop_curve: ComputePipeline,
 
+    charge_rx: mpsc::Receiver<Charge>,
     push_rx: mpsc::Receiver<(Point, u32)>,
     pop_rx: mpsc::Receiver<u32>,
 
@@ -37,7 +39,8 @@ pub struct LineRenderer {
 
 /// State required for requesting a line be rendered.
 #[derive(Clone)]
-pub struct LineSender {
+pub struct ParticleSender {
+    charge_tx: mpsc::Sender<Charge>,
     push_tx: mpsc::Sender<(Point, u32)>,
     pop_tx: mpsc::Sender<u32>,
 }
@@ -64,16 +67,33 @@ struct Curve {
     num_points: i32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct Charge {
+    pos: Point,
+    charge: f32,
+    _pad: u32,
+}
+
 pub fn line_renderer(
     device: &wgpu::Device,
     adapter: &wgpu::Adapter,
     surface: &wgpu::Surface,
-) -> (LineSender, LineRenderer) {
+) -> (ParticleSender, ParticleRenderer) {
+    let (charge_tx, charge_rx) = mpsc::channel();
     let (push_tx, push_rx) = mpsc::channel();
     let (pop_tx, pop_rx) = mpsc::channel();
-    let renderer = LineRenderer::with_channel(device, adapter, surface, push_rx, pop_rx);
+    let renderer =
+        ParticleRenderer::with_channel(device, adapter, surface, charge_rx, push_rx, pop_rx);
 
-    (LineSender { push_tx, pop_tx }, renderer)
+    (
+        ParticleSender {
+            push_tx,
+            pop_tx,
+            charge_tx,
+        },
+        renderer,
+    )
 }
 
 // This is arbitrary, 16MB right now
@@ -90,7 +110,7 @@ const INDIRECT_DRAW_SIZE: u32 = 6 * 4;
 const INDIRECT_DISPATCH_SIZE: u32 = 3 * 4;
 const CHARGE_SIZE: u32 = 4 * 4;
 
-impl LineRenderer {
+impl ParticleRenderer {
     /// Given a device, command queue and a texture to draw to, render the lines.
     pub fn render(
         &mut self,
@@ -100,6 +120,16 @@ impl LineRenderer {
     ) {
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
+        let charges: Vec<Charge> = self.charge_rx.try_iter().collect();
+        queue.write_buffer(
+            &self.charge_buf,
+            ((self.num_charges + 1) * CHARGE_SIZE).into(),
+            cast_slice(charges.as_slice()),
+        );
+
+        self.num_charges += charges.len() as u32;
+        queue.write_buffer(&self.charge_buf, 0, cast_slice(&[self.num_charges]));
 
         let push_commands_iter = self.push_rx.try_iter().map(|(pos, curve_index)| {
             (
@@ -165,11 +195,12 @@ impl LineRenderer {
         queue.submit(Some(encoder.finish()));
     }
 
-    /// Create a new LineRenderer given a device, adapter and surface.
+    /// Create a new ParticleRenderer given a device, adapter and surface.
     fn with_channel(
         device: &wgpu::Device,
         adapter: &wgpu::Adapter,
         surface: &wgpu::Surface,
+        charge_rx: mpsc::Receiver<Charge>,
         push_rx: mpsc::Receiver<(Point, u32)>,
         pop_rx: mpsc::Receiver<u32>,
     ) -> Self {
@@ -206,7 +237,7 @@ impl LineRenderer {
 
         // Charge buffer size
         let charge_buf_size_bytes = device.limits().max_uniform_buffer_binding_size.min(16384);
-        let max_num_charges = charge_buf_size_bytes / CHARGE_SIZE;
+        let max_num_charges = charge_buf_size_bytes / CHARGE_SIZE - 1;
 
         shader_loader.bind("PUSH_BUF_LOGICAL_SIZE", max_push_per_frame.to_string());
         shader_loader.bind("POP_BUF_LOGICAL_SIZE", max_pops_per_frame.to_string());
@@ -370,7 +401,7 @@ impl LineRenderer {
         // Create the particle compute pipeline
         let charge_buf = create_buffer_with_size(
             device,
-            wgpu::BufferUsages::UNIFORM,
+            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             device.limits().max_uniform_buffer_binding_size,
         );
 
@@ -396,12 +427,14 @@ impl LineRenderer {
             index_buf,
             render_pipeline,
             render_bundle,
+            num_charges: 0,
             charge_buf,
             compute_particle,
             compute_push_buf,
             compute_push_curve,
             compute_pop_buf,
             compute_pop_curve,
+            charge_rx,
             push_rx,
             pop_rx,
             max_push_per_frame,
@@ -414,7 +447,7 @@ impl LineRenderer {
 }
 
 // TODO: This should be a memory-mapped shared buffer
-impl LineSender {
+impl ParticleSender {
     pub fn push_point(
         &self,
         point: Point,
@@ -425,6 +458,21 @@ impl LineSender {
 
     pub fn pop_point(&self, curve: u32) -> Result<(), mpsc::SendError<u32>> {
         self.pop_tx.send(curve)
+    }
+
+    pub fn push_charge(
+        &self,
+        pos: Point,
+        charge: f32,
+    ) -> Result<(), mpsc::SendError<(Point, f32)>> {
+        match self.charge_tx.send(Charge {
+            pos,
+            charge,
+            _pad: 0,
+        }) {
+            Ok(..) => Ok(()),
+            Err(..) => Err(mpsc::SendError((pos, charge))),
+        }
     }
 }
 

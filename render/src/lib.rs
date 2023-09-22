@@ -60,6 +60,8 @@ async fn run_async() -> ! {
     surface.configure(&device, &config);
 
     let (sender, mut renderer) = line_renderer(&device, &adapter, &surface);
+    sender.push_charge(Point(-0.5, 0.0), 1.0).unwrap();
+    sender.push_charge(Point(0.5, 0.0), -1.0).unwrap();
 
     window.run(
         move || {
