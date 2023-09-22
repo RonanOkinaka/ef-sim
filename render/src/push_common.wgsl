@@ -4,7 +4,8 @@
 ///  - Two vertices, placing them adjacent to each other
 ///  - Six indices (one quad)
 ///  - The midpoint for a curve that has 2+ points
-fn push_vertex(pos: vec2<f32>, curve_index: u32) {
+/// Returns the number of points now in the curve.
+fn push_vertex(pos: vec2<f32>, curve_index: u32) -> i32 {
     var curve = state.curves.data[curve_index];
     let vertex_index = allocate_vertices();
 
@@ -32,7 +33,10 @@ fn push_vertex(pos: vec2<f32>, curve_index: u32) {
     vertices.data[vertex_index + 1] = Vertex(pos, -new_ray, 1.0, index_index);
 
     curve.head_index = vertex_index;
+    curve.num_points += 1;
     state.curves.data[curve_index] = curve;
+
+    return curve.num_points;
 }
 
 /// Allocate space for two vertices.

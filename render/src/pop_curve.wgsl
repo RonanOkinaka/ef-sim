@@ -32,9 +32,10 @@ fn pop_vertex(curve_index: u32) {
         return;
     }
 
-    // Otherwise, turn the segment invisible
+    // Otherwise, turn the segment invisible and decrement the curve's size
     vertices.data[curve.tail_index    ].alpha = 0.0;
     vertices.data[curve.tail_index + 1].alpha = 0.0;
+    curve.num_points -= 1;
 
     // Traverse the linked list
     let next_index = vertices.data[curve.tail_index].next;

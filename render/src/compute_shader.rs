@@ -10,6 +10,7 @@ pub enum ComputePipelineBuffer<'a> {
     #[allow(dead_code)]
     Uniform(&'a wgpu::Buffer),
     Storage(&'a wgpu::Buffer),
+    StorageReadOnly(&'a wgpu::Buffer),
 }
 
 impl ComputePipeline {
@@ -54,6 +55,19 @@ impl ComputePipeline {
                         binding,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: storage_binding,
+                        count: None,
+                    });
+                    inner
+                }
+                ComputePipelineBuffer::StorageReadOnly(inner) => {
+                    layout_entries.push(wgpu::BindGroupLayoutEntry {
+                        binding,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
                         count: None,
                     });
                     inner
@@ -108,5 +122,17 @@ impl ComputePipeline {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.dispatch_workgroups(num_work_groups, 1, 1);
+    }
+
+    pub fn run_indirect(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        params: &wgpu::Buffer,
+        offset: u64,
+    ) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.dispatch_workgroups_indirect(params, offset);
     }
 }

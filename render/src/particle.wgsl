@@ -50,9 +50,16 @@ fn particle_main(@builtin(global_invocation_id) global_invocation_id: vec3<u32>)
     pos += vec2<f32>(0.01, 0.0);
 
     // We'll push here instead of dispatching another shader for it
-    push_vertex(pos, curve_index);
+    let num_points = push_vertex(pos, curve_index);
 
     // Pops will stay separate, however, mostly for synchronization reasons
+    if (num_points >= $$MAX_POINTS_PER_CURVE$$ /* TODO: This should be dynamic */) {
+        let pop_index = atomicAdd(&pop_commands.size, 1u);
+        pop_commands.data[pop_index] = PopCommand(curve_index);
+
+        let num_workgroups_x = (pop_index + $$WORKGROUP_SIZE_X$$u) / ($$WORKGROUP_SIZE_X$$u);
+        atomicMax(&pop_commands.dispatch.workgroups_x, num_workgroups_x);
+    }
 }
 
 $$INCLUDE_PUSH_COMMON_WGSL$$
