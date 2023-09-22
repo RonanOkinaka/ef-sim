@@ -6,6 +6,7 @@ use std::sync::mpsc;
 use util::math::Point;
 
 use crate::compute_shader::*;
+use crate::render_util::Renderer;
 use crate::shader::WgslLoader;
 
 /// State required for rendering lines.
@@ -75,7 +76,7 @@ struct Charge {
     _pad: u32,
 }
 
-pub fn line_renderer(
+pub fn particle_renderer(
     device: &wgpu::Device,
     adapter: &wgpu::Adapter,
     surface: &wgpu::Surface,
@@ -110,14 +111,13 @@ const INDIRECT_DRAW_SIZE: u32 = 6 * 4;
 const INDIRECT_DISPATCH_SIZE: u32 = 3 * 4;
 const CHARGE_SIZE: u32 = 4 * 4;
 
-impl ParticleRenderer {
-    /// Given a device, command queue and a texture to draw to, render the lines.
-    pub fn render(
+impl Renderer for ParticleRenderer {
+    fn render(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         frame_view: &wgpu::TextureView,
-    ) {
+    ) -> wgpu::CommandBuffer {
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
@@ -192,9 +192,11 @@ impl ParticleRenderer {
             pass.execute_bundles([&self.render_bundle]);
         }
 
-        queue.submit(Some(encoder.finish()));
+        encoder.finish()
     }
+}
 
+impl ParticleRenderer {
     /// Create a new ParticleRenderer given a device, adapter and surface.
     fn with_channel(
         device: &wgpu::Device,
