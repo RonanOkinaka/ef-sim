@@ -103,7 +103,7 @@ const DEFAULT_BUFFER_SIZE: u32 = 16777216;
 const PUSH_COMMAND_SIZE: u32 = 16;
 const PUSH_COMMAND_ALIGN: u32 = 8;
 const POP_COMMAND_SIZE: u32 = 4;
-const CURVE_SIZE: u32 = 3 * 4;
+const CURVE_SIZE: u32 = 4 * 4;
 const INDEX_SIZE: u32 = 4;
 const VERTEX_SIZE: u32 = 6 * 4;
 const QUAD_INDEX_SIZE: u32 = INDEX_SIZE * 6;
@@ -143,25 +143,6 @@ impl Renderer for ParticleRenderer {
         });
 
         let push_commands = partition_curve_updates(push_commands_iter, self.max_push_per_frame);
-
-        if push_commands.is_empty() {
-            // Reset the pop buffer and dispatch data
-            queue.write_buffer(
-                &self.compute_pop_buf,
-                0,
-                cast_slice::<u32, u8>(&[
-                    1, // Pop workgroup x [It would be nice if this could be 0, but I'm not sure if that's allowed]
-                    1, // Pop workgroup y
-                    1, // Pop workgroup z
-                    0, // # points to pop
-                ]),
-            );
-
-            self.compute_particle.run(&mut encoder, 1);
-            self.compute_pop_curve
-                .run_indirect(&mut encoder, &self.compute_pop_buf, 0);
-        }
-
         for push_pass in push_commands {
             let len = push_pass.len() as u32;
 
@@ -174,6 +155,22 @@ impl Renderer for ParticleRenderer {
 
             self.compute_push_curve.run(&mut encoder, len);
         }
+
+        // Reset the pop buffer and dispatch data
+        queue.write_buffer(
+            &self.compute_pop_buf,
+            0,
+            cast_slice::<u32, u8>(&[
+                1, // Pop workgroup x [It would be nice if this could be 0, but I'm not sure if that's allowed]
+                1, // Pop workgroup y
+                1, // Pop workgroup z
+                0, // # points to pop
+            ]),
+        );
+
+        self.compute_particle.run(&mut encoder, 1);
+        self.compute_pop_curve
+            .run_indirect(&mut encoder, &self.compute_pop_buf, 0);
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -246,7 +243,9 @@ impl ParticleRenderer {
         shader_loader.bind("CURVE_BUF_LOGICAL_SIZE", max_num_curves.to_string());
         shader_loader.bind("FREE_LIST_LOGICAL_SIZE", free_list_stack_size.to_string());
         shader_loader.bind("CHARGE_BUF_LOGICAL_SIZE", max_num_charges.to_string());
+
         shader_loader.bind("MAX_POINTS_PER_CURVE", "10".to_owned());
+        shader_loader.bind("CHARGE_COLLISION_RADIUS", "0.1".to_owned());
 
         shader_loader.add_common_source(include_str!("common.wgsl"));
         shader_loader.bind(

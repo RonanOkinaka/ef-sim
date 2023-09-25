@@ -5,7 +5,7 @@
 ///  - Six indices (one quad)
 ///  - The midpoint for a curve that has 2+ points
 /// Returns the number of points now in the curve.
-fn push_vertex(pos: vec2<f32>, curve_index: u32) -> i32 {
+fn push_vertex(pos: vec2<f32>, curve_index: u32) -> vec2<i32> {
     var curve = state.curves.data[curve_index];
     let vertex_index = allocate_vertices();
 
@@ -13,7 +13,47 @@ fn push_vertex(pos: vec2<f32>, curve_index: u32) -> i32 {
     var new_ray = vec2<f32>(0.0, 0.0);
     if (curve.tail_index >= 0) {
         // If we have 2+ points, calculate the new ray based on the previous point
-        new_ray = calculate_new_rays(curve.head_index, pos);
+        let prev_vertex = vertices.data[curve.head_index];
+
+        let ray_between = pos - prev_vertex.pos;
+        let mag = length(ray_between);
+
+        if (mag < 0.001) {
+            // Basically no difference, just ignore it
+            new_ray = prev_vertex.ray;
+        } else {
+            new_ray = vec2<f32>(-ray_between.y, ray_between.x) / mag;
+
+            if (prev_vertex.ray.x == 0.0 && prev_vertex.ray.y == 0.0) {
+                // If the previous ray is invalid, use the same for both
+                vertices.data[curve.head_index    ].ray =  new_ray;
+                vertices.data[curve.head_index + 1].ray = -new_ray;
+            } else {
+                // Otherwise, calculate the new midpoint ray
+                // Note: I know this is difficult to read, just trust me
+                // on its correctness lol
+                let u = normalize(prev_vertex.ray);
+                let v = new_ray;
+
+                let diff = dot(u, v);
+                if (abs(diff) > 0.8) {
+                    if (diff > 0.0) {
+                        // Going straight, use the old ray
+                        new_ray = prev_vertex.ray;
+                    } else {
+                        // Turned exactly around, kill the curve
+                        return vec2<i32>(curve.num_points, 0);
+                    }
+                } else {
+                    let w = vec2<f32>(u.y, -u.x);
+                    let mul = dot(v, v - u) / dot(v, w);
+
+                    let mid_ray = (w * mul + u);
+                    vertices.data[curve.head_index    ].ray =  mid_ray;
+                    vertices.data[curve.head_index + 1].ray = -mid_ray;
+                }
+            }
+        }
 
         // Write the indices out
         index_index = push_quad_indices(curve.head_index, vertex_index);
@@ -36,7 +76,7 @@ fn push_vertex(pos: vec2<f32>, curve_index: u32) -> i32 {
     curve.num_points += 1;
     state.curves.data[curve_index] = curve;
 
-    return curve.num_points;
+    return vec2<i32>(curve.num_points, 1);
 }
 
 /// Allocate space for two vertices.
@@ -76,49 +116,4 @@ fn push_quad_indices(i: i32, j: i32) -> i32 {
     indices.data[index + 5] = j;
 
     return index;
-}
-
-/// Compute the rays for the current- and mid-point of the segment list.
-fn calculate_new_rays(prev_index: i32, new_pos: vec2<f32>) -> vec2<f32> {
-    let prev_vertex = vertices.data[prev_index];
-
-    let ray_between = new_pos - prev_vertex.pos;
-    let mag = length(ray_between);
-
-    if (mag < 0.001) {
-        // Basically no difference, just ignore it
-        return prev_vertex.ray;
-    }
-
-    let new_ray = vec2<f32>(-ray_between.y, ray_between.x) / mag;
-
-    if (prev_vertex.ray.x == 0.0 && prev_vertex.ray.y == 0.0) {
-        // If the previous ray is invalid, use the same for both
-        vertices.data[prev_index    ].ray =  new_ray;
-        vertices.data[prev_index + 1].ray = -new_ray;
-        return new_ray;
-    }
-
-    // Otherwise, calculate the new midpoint ray
-    // Note: I know this is difficult to read, just trust me
-    // on its correctness lol
-    let u = normalize(prev_vertex.ray);
-    let v = new_ray;
-    let w = vec2<f32>(u.y, -u.x);
-
-    var det = dot(v, w);
-
-    // If it's really small, round it to the previous ray
-    if (det * sign(det) < 0.1) {
-        // This creates a "poisoned" segment with a small visual artifact
-        // on both ends, but it's not hugely important to fix
-        return prev_vertex.ray;
-    }
-
-    let mul = dot(v, v - u) / det;
-    let mid_ray = (w * mul + u);
-    vertices.data[prev_index    ].ray =  mid_ray;
-    vertices.data[prev_index + 1].ray = -mid_ray;
-
-    return new_ray;
 }

@@ -38,6 +38,8 @@ fn particle_main(@builtin(global_invocation_id) global_invocation_id: vec3<u32>)
     }
 
     let head_index = state.curves.data[curve_index].head_index;
+    var alive = bool(state.curves.data[curve_index].alive);
+    var num_points = state.curves.data[curve_index].num_points;
 
     // TODO: If we have no head, create a new point near an existing particle
     if (head_index < 0) {
@@ -48,21 +50,44 @@ fn particle_main(@builtin(global_invocation_id) global_invocation_id: vec3<u32>)
     var pos = vertices.data[head_index].pos;
 
     // Calculate our next value
-    var ds = vec2<f32>(0.0, 0.0);
-    for (var i: i32; i < charges.size.x; i += 1) {
-        let ray = pos - charges.data[i].pos;
-        var mag = length(ray);
-        mag *= mag;
+    if (alive) {
+        var ds = vec2<f32>(0.0, 0.0);
+        for (var i: i32; i < charges.size.x; i += 1) {
+            let ray = pos - charges.data[i].pos;
+            var mag = length(ray);
 
-        ds += charges.data[i].charge * ray / mag;
+            if (mag < $$CHARGE_COLLISION_RADIUS$$) {
+                alive = false;
+                break;
+            }
+
+            mag *= mag;
+            ds += charges.data[i].charge * ray / mag;
+        }
+
+        // Don't want to get stuck in a sink (e.g. exactly between two equal charges)
+        if (length(ds) > 0.001) {
+            pos += normalize(ds) * 0.01;
+        } else {
+            alive = false;
+        }
     }
-    pos += normalize(ds) * 0.01;
 
-    // We'll push here instead of dispatching another shader for it
-    let num_points = push_vertex(pos, curve_index);
+    if (alive) {
+        // We'll push here instead of dispatching another shader for it
+        let ret = push_vertex(pos, curve_index);
+        num_points = ret.x;
+        alive = bool(ret.y);
+    }
+
+    var should_pop = (num_points >= $$MAX_POINTS_PER_CURVE$$); // TODO: This should be dynamic
+    if (!alive) {
+        state.curves.data[curve_index].alive = 0;
+        should_pop |= bool(num_points);
+    }
 
     // Pops will stay separate, however, mostly for synchronization reasons
-    if (num_points >= $$MAX_POINTS_PER_CURVE$$ /* TODO: This should be dynamic */) {
+    if (should_pop) {
         let pop_index = atomicAdd(&pop_commands.size, 1u);
         pop_commands.data[pop_index] = PopCommand(curve_index);
 
