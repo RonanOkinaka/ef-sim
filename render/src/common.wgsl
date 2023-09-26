@@ -32,7 +32,8 @@ struct Curve {
 
 /// Buffer for all curves.
 struct CurveBuffer {
-    size: u32,
+    target_size: i32,
+    size: atomic<i32>,
     data: array<Curve, $$CURVE_BUF_LOGICAL_SIZE$$>,
 }
 
@@ -56,6 +57,7 @@ struct IndirectIndexedDraw {
 /// Stores our higher-level logical constructs.
 struct ComputeState {
     draw: IndirectIndexedDraw,
+    dispatch_size: u32,
     curves: CurveBuffer,
     vert_free: FreeList,
     indx_free: FreeList,

@@ -2,8 +2,8 @@
 
 use bytemuck::{cast_slice, cast_slice_mut, Pod, Zeroable};
 use rand::Rng;
-use std::collections::HashMap;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{mpsc, Arc};
 use util::math::Point;
 
 use crate::compute_shader::*;
@@ -19,6 +19,7 @@ pub struct ParticleRenderer {
     render_bundle: wgpu::RenderBundle,
 
     num_charges: u32,
+    state_buf: wgpu::Buffer,
     param_buf: wgpu::Buffer,
     charge_buf: wgpu::Buffer,
     compute_particle: ComputePipeline,
@@ -30,8 +31,8 @@ pub struct ParticleRenderer {
     compute_pop_curve: ComputePipeline,
 
     charge_rx: mpsc::Receiver<Charge>,
-    push_rx: mpsc::Receiver<(Point, u32)>,
-    pop_rx: mpsc::Receiver<u32>,
+    target_num_curves: Arc<AtomicU32>,
+    current_num_curves: u32,
 
     max_push_per_frame: u32,
     max_pops_per_frame: u32,
@@ -44,8 +45,7 @@ pub struct ParticleRenderer {
 #[derive(Clone)]
 pub struct ParticleSender {
     charge_tx: mpsc::Sender<Charge>,
-    push_tx: mpsc::Sender<(Point, u32)>,
-    pop_tx: mpsc::Sender<u32>,
+    target_num_curves: Arc<AtomicU32>,
 }
 
 #[repr(C)]
@@ -90,16 +90,20 @@ pub fn particle_renderer(
     surface: &wgpu::Surface,
 ) -> (ParticleSender, ParticleRenderer) {
     let (charge_tx, charge_rx) = mpsc::channel();
-    let (push_tx, push_rx) = mpsc::channel();
-    let (pop_tx, pop_rx) = mpsc::channel();
-    let renderer =
-        ParticleRenderer::with_channel(device, adapter, surface, charge_rx, push_rx, pop_rx);
+    let target_num_curves = Arc::new(AtomicU32::new(0));
+
+    let renderer = ParticleRenderer::with_channel(
+        device,
+        adapter,
+        surface,
+        charge_rx,
+        target_num_curves.clone(),
+    );
 
     (
         ParticleSender {
-            push_tx,
-            pop_tx,
             charge_tx,
+            target_num_curves,
         },
         renderer,
     )
@@ -109,13 +113,13 @@ pub fn particle_renderer(
 const DEFAULT_BUFFER_SIZE: u32 = 16777216;
 
 const PUSH_COMMAND_SIZE: u32 = 16;
-const PUSH_COMMAND_ALIGN: u32 = 8;
 const POP_COMMAND_SIZE: u32 = 4;
 const CURVE_SIZE: u32 = 4 * 4;
 const INDEX_SIZE: u32 = 4;
 const VERTEX_SIZE: u32 = 6 * 4;
 const QUAD_INDEX_SIZE: u32 = INDEX_SIZE * 6;
-const INDIRECT_DRAW_SIZE: u32 = 6 * 4;
+const INDIRECT_DRAW_SIZE: u32 = 5 * 4;
+const CURVE_PRELUDE_SIZE: u32 = INDIRECT_DRAW_SIZE + 3 * 4;
 const INDIRECT_DISPATCH_SIZE: u32 = 3 * 4;
 const CHARGE_SIZE: u32 = 4 * 4;
 
@@ -139,31 +143,6 @@ impl Renderer for ParticleRenderer {
         self.num_charges += charges.len() as u32;
         queue.write_buffer(&self.charge_buf, 0, cast_slice(&[self.num_charges]));
 
-        let push_commands_iter = self.push_rx.try_iter().map(|(pos, curve_index)| {
-            (
-                curve_index,
-                PushCommand {
-                    pos,
-                    curve_index,
-                    _pad: 0,
-                },
-            )
-        });
-
-        let push_commands = partition_curve_updates(push_commands_iter, self.max_push_per_frame);
-        for push_pass in push_commands {
-            let len = push_pass.len() as u32;
-
-            queue.write_buffer(&self.compute_push_buf, 0, cast_slice(&[len]));
-            queue.write_buffer(
-                &self.compute_push_buf,
-                PUSH_COMMAND_ALIGN.into(),
-                cast_slice(push_pass.as_slice()),
-            );
-
-            self.compute_push_curve.run(&mut encoder, len);
-        }
-
         // Reset the pop buffer and dispatch data
         queue.write_buffer(
             &self.compute_pop_buf,
@@ -185,7 +164,18 @@ impl Renderer for ParticleRenderer {
             }]),
         );
 
-        self.compute_particle.run(&mut encoder, 1000);
+        let target_num_curves = self.target_num_curves.load(Ordering::Relaxed);
+        if target_num_curves != self.current_num_curves {
+            self.current_num_curves = self.current_num_curves.max(target_num_curves);
+            queue.write_buffer(
+                &self.state_buf,
+                INDIRECT_DRAW_SIZE.into(),
+                cast_slice(&[self.current_num_curves, target_num_curves]),
+            );
+        }
+
+        self.compute_particle
+            .run(&mut encoder, self.current_num_curves);
         self.compute_pop_curve
             .run_indirect(&mut encoder, &self.compute_pop_buf, 0);
 
@@ -217,8 +207,7 @@ impl ParticleRenderer {
         adapter: &wgpu::Adapter,
         surface: &wgpu::Surface,
         charge_rx: mpsc::Receiver<Charge>,
-        push_rx: mpsc::Receiver<(Point, u32)>,
-        pop_rx: mpsc::Receiver<u32>,
+        target_num_curves: Arc<AtomicU32>,
     ) -> Self {
         // Smaller between the default and max size for a storage buffer
         let default_buffer_size = device
@@ -242,7 +231,7 @@ impl ParticleRenderer {
 
         // The vertex + index free lists, and the curve structures, share space in one buffer
         // The curves get one half [without the indirect draw buffer]
-        let curve_buf_size_bytes = (default_buffer_size) / 2 - INDIRECT_DRAW_SIZE;
+        let curve_buf_size_bytes = (default_buffer_size) / 2 - CURVE_PRELUDE_SIZE;
 
         // And each one is 12 bytes
         let max_num_curves = curve_buf_size_bytes / CURVE_SIZE;
@@ -279,19 +268,21 @@ impl ParticleRenderer {
         );
         {
             let mut curve_slice = state_buf
-                .slice(..(INDIRECT_DRAW_SIZE as u64))
+                .slice(..(CURVE_PRELUDE_SIZE as u64))
                 .get_mapped_range_mut();
             cast_slice_mut(&mut curve_slice).copy_from_slice(bytemuck::cast_slice::<u32, u8>(&[
-                0,    // # indices
-                1,    // # instances (1, always)
-                0,    // Index buffer offset
-                0,    // Vertex buffer offset
-                0,    // Instance offset
-                1000, // Curve buffer size
+                0, // # indices
+                1, // # instances (1, always)
+                0, // Index buffer offset
+                0, // Vertex buffer offset
+                0, // Instance offset
+                0, // Dispatch size
+                0, // Curve buffer target size
+                0, // Curve buffer current size
             ]));
 
             let mut curve_slice = state_buf
-                .slice((INDIRECT_DRAW_SIZE as u64)..(curve_buf_size_bytes as u64))
+                .slice((CURVE_PRELUDE_SIZE as u64)..(curve_buf_size_bytes as u64))
                 .get_mapped_range_mut();
             cast_slice_mut(&mut curve_slice).fill(-1);
         }
@@ -453,6 +444,7 @@ impl ParticleRenderer {
             render_pipeline,
             render_bundle,
             num_charges: 0,
+            state_buf,
             param_buf,
             charge_buf,
             compute_particle,
@@ -461,8 +453,8 @@ impl ParticleRenderer {
             compute_pop_buf,
             compute_pop_curve,
             charge_rx,
-            push_rx,
-            pop_rx,
+            target_num_curves,
+            current_num_curves: 0,
             max_push_per_frame,
             max_pops_per_frame,
             max_num_points,
@@ -472,20 +464,7 @@ impl ParticleRenderer {
     }
 }
 
-// TODO: This should be a memory-mapped shared buffer
 impl ParticleSender {
-    pub fn push_point(
-        &self,
-        point: Point,
-        curve: u32,
-    ) -> Result<(), mpsc::SendError<(Point, u32)>> {
-        self.push_tx.send((point, curve))
-    }
-
-    pub fn pop_point(&self, curve: u32) -> Result<(), mpsc::SendError<u32>> {
-        self.pop_tx.send(curve)
-    }
-
     pub fn push_charge(
         &self,
         pos: Point,
@@ -499,6 +478,10 @@ impl ParticleSender {
             Ok(..) => Ok(()),
             Err(..) => Err(mpsc::SendError((pos, charge))),
         }
+    }
+
+    pub fn set_num_curves(&self, num_curves: u32) {
+        self.target_num_curves.store(num_curves, Ordering::Relaxed);
     }
 }
 
@@ -522,36 +505,4 @@ fn create_buffer_with_size(
     size: u32,
 ) -> wgpu::Buffer {
     create_buffer_with_size_mapped(device, usage, size, false)
-}
-
-/// In order of arrival, partition curve updates such that
-/// one curve is not more than once per pass, and the number
-/// of updates does not surpass the command buffer size.
-fn partition_curve_updates<T, I>(iter: I, limit: u32) -> Vec<Vec<T>>
-where
-    I: Iterator<Item = (u32, T)>,
-{
-    let limit = limit as usize;
-    let mut ret = Vec::<Vec<_>>::new();
-    let mut gen_map = HashMap::<u32, i32>::new();
-    let mut first_not_full = 0;
-    let mut len = 0;
-
-    for (curve, value) in iter {
-        let gen = gen_map.entry(curve).or_insert(-1);
-        *gen = first_not_full.max(*gen + 1);
-
-        let gen = *gen as usize;
-        if gen >= len {
-            ret.push(Vec::new());
-            len += 1;
-        }
-
-        ret[gen].push(value);
-        if ret[gen].len() == limit {
-            first_not_full += 1;
-        }
-    }
-
-    ret
 }

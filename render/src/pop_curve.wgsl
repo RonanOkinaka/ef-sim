@@ -41,6 +41,7 @@ fn pop_vertex(curve_index: u32) {
     let next_index = vertices.data[curve.tail_index].next;
     if (curve.tail_index == curve.head_index) {
         curve.head_index = -1;
+        atomicSub(&state.curves.size, 1);
     } else {
         let next_vertex = vertices.data[next_index];
 

@@ -31,6 +31,18 @@ async fn run_async() -> ! {
     render.add_renderer(particle_renderer);
     render.add_renderer(circle_renderer);
 
+    // Help us test changing particle quantities
+    println!("Enter the target quantity of particles and press enter.");
+    std::thread::spawn(move || loop {
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).unwrap();
+
+        match line.trim_end().parse::<u32>() {
+            Ok(num_curves) => sender.set_num_curves(num_curves),
+            Err(..) => println!("Please enter a positive integer!"),
+        }
+    });
+
     window.run(move || render.render(), move |_input_event| {});
 }
 

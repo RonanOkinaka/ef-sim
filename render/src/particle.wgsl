@@ -40,7 +40,7 @@ struct Params {
 @workgroup_size($$WORKGROUP_SIZE_X$$)
 fn particle_main(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
     let curve_index = global_invocation_id.x;
-    if (curve_index >= state.curves.size) {
+    if (curve_index >= state.dispatch_size) {
         return;
     }
 
@@ -50,23 +50,31 @@ fn particle_main(@builtin(global_invocation_id) global_invocation_id: vec3<u32>)
 
     var pos = vec2<f32>(0.0, 0.0);
 
+    // Create a new curve
     if (head_index < 0) {
-        // TODO: We can do much better than this
-        let rand = (params.rand_value ^ curve_index);
-        let charge_index = rand % charges.size.x;
+        // But only if we want it!
+        if (atomicAdd(&state.curves.size, 1) < state.curves.target_size) {
+            // TODO: We can do much better than this
+            let rand = (params.rand_value ^ curve_index);
+            let charge_index = rand % charges.size.x;
 
-        // The trig functions seem to struggle with large values, so reduce them
-        let angle = f32(rand % 2097152u);
+            // The trig functions seem to struggle with large values, so reduce them
+            let angle = f32(rand % 2097152u);
 
-        let offset = $$CHARGE_COLLISION_RADIUS$$ * vec2<f32>(cos(angle), sin(angle));
-        pos = charges.data[charge_index].pos + offset;
+            let offset = $$CHARGE_COLLISION_RADIUS$$ * vec2<f32>(cos(angle), sin(angle));
+            pos = charges.data[charge_index].pos + offset;
 
-        // Reset the curve
-        if (charges.data[charge_index].charge > 0.0) {
-            alive = true;
-            state.curves.data[curve_index] = Curve(-1, -1, 0, 1);
+            // Reset the curve
+            if (charges.data[charge_index].charge > 0.0) {
+                alive = true;
+                state.curves.data[curve_index] = Curve(-1, -1, 0, 1);
+            } else {
+                alive = false;
+                atomicSub(&state.curves.size, 1);
+            }
         } else {
             alive = false;
+            atomicSub(&state.curves.size, 1);
         }
     }
     // Calculate our next value
