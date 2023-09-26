@@ -1,14 +1,19 @@
 //! Renderer for drawing solid-color, billboarded circles.
 
 use bytemuck::cast_slice;
+use std::sync::mpsc;
 use util::math::Point;
 use wgpu::util::DeviceExt;
 
 use crate::render_util::Renderer;
 use crate::shader::WgslLoader;
 
+/// Renderer responsible for drawing circle billboards.
 pub struct CircleRenderer {
+    circle_rx: mpsc::Receiver<(Point, f32)>,
+
     num_verts: u32,
+    max_num_verts: u32,
     vertices: wgpu::Buffer,
 
     billboard: wgpu::TextureView,
@@ -20,13 +25,35 @@ pub struct CircleRenderer {
     render_bind_group: wgpu::BindGroup,
 }
 
-const VERTEX_SIZE: u64 = 4 * 4;
+/// Channel by which one may request a circle be drawn.
+#[derive(Clone)]
+pub struct CircleSender {
+    circle_tx: mpsc::Sender<(Point, f32)>,
+}
+
+pub fn circle_renderer(
+    device: &wgpu::Device,
+    adapter: &wgpu::Adapter,
+    surface: &wgpu::Surface,
+    max_num_billboards: u32,
+) -> (CircleSender, CircleRenderer) {
+    let (circle_tx, circle_rx) = mpsc::channel();
+    (
+        CircleSender { circle_tx },
+        CircleRenderer::with_channel(device, adapter, surface, circle_rx, max_num_billboards),
+    )
+}
+
+const FLOATS_PER_VERTEX: u64 = 4;
+const VERTEX_SIZE: u64 = 4 * FLOATS_PER_VERTEX;
+const VERTS_PER_QUAD: u64 = 6;
+const FLOATS_PER_QUAD: u64 = VERTS_PER_QUAD * 4;
 
 impl Renderer for CircleRenderer {
     fn render(
         &mut self,
         device: &wgpu::Device,
-        _queue: &wgpu::Queue,
+        queue: &wgpu::Queue,
         frame_view: &wgpu::TextureView,
     ) -> wgpu::CommandBuffer {
         let mut encoder =
@@ -36,6 +63,8 @@ impl Renderer for CircleRenderer {
             self.billboard_ready = true;
             self.create_billboard(&mut encoder);
         }
+
+        self.update(queue);
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -62,10 +91,11 @@ impl Renderer for CircleRenderer {
 }
 
 impl CircleRenderer {
-    pub fn new(
+    fn with_channel(
         device: &wgpu::Device,
         adapter: &wgpu::Adapter,
         surface: &wgpu::Surface,
+        circle_rx: mpsc::Receiver<(Point, f32)>,
         max_num_billboards: u32,
     ) -> Self {
         // Create the billboard generation pipeline
@@ -248,8 +278,10 @@ impl CircleRenderer {
         });
 
         Self {
+            circle_rx,
             vertices,
             num_verts: 0,
+            max_num_verts: max_num_billboards * VERTS_PER_QUAD as u32,
             billboard,
             billboard_verts,
             billboard_pipeline,
@@ -259,26 +291,43 @@ impl CircleRenderer {
         }
     }
 
-    pub fn push_circle(&mut self, pos: Point, width: f32, queue: &wgpu::Queue) {
+    fn update(&mut self, queue: &wgpu::Queue) {
+        let num_quads_allowed = (self.max_num_verts - self.num_verts) / VERTS_PER_QUAD as u32;
+
+        let verts: Vec<_> = self
+            .circle_rx
+            .try_iter()
+            .map(|(pos, radius)| Self::circle_to_slice(pos, radius))
+            .take(num_quads_allowed as usize)
+            .flatten()
+            .collect();
+
+        if !verts.is_empty() {
+            queue.write_buffer(
+                &self.vertices,
+                VERTEX_SIZE * self.num_verts as u64,
+                cast_slice(verts.as_slice()),
+            );
+
+            self.num_verts += verts.len() as u32 / FLOATS_PER_VERTEX as u32;
+        }
+    }
+
+    #[rustfmt::skip]
+    fn circle_to_slice(pos: Point, width: f32) -> [f32; FLOATS_PER_QUAD as usize] {
         let right = pos.0 + width;
         let left = pos.0 - width;
         let top = pos.1 + width;
         let bottom = pos.1 - width;
 
-        #[rustfmt::skip]
-        queue.write_buffer(
-            &self.vertices,
-            VERTEX_SIZE * self.num_verts as u64,
-            cast_slice(&[
-                right, top, 1.0, 0.0,
-                left, top, 0.0, 0.0,
-                left, bottom, 0.0, 1.0,
-                left, bottom, 0.0, 1.0,
-                right, bottom, 1.0, 1.0,
-                right, top, 1.0, 0.0,
-            ]),
-        );
-        self.num_verts += 6;
+        [
+            right, top, 1.0, 0.0,
+            left, top, 0.0, 0.0,
+            left, bottom, 0.0, 1.0,
+            left, bottom, 0.0, 1.0,
+            right, bottom, 1.0, 1.0,
+            right, top, 1.0, 0.0,
+        ]
     }
 
     /// Render a pixel-perfect circle to our billboard texture.
@@ -300,5 +349,15 @@ impl CircleRenderer {
         pass.set_pipeline(&self.billboard_pipeline);
         pass.set_vertex_buffer(0, self.billboard_verts.slice(..));
         pass.draw(0..6, 0..1);
+    }
+}
+
+impl CircleSender {
+    pub fn push_circle(
+        &self,
+        pos: Point,
+        radius: f32,
+    ) -> Result<(), mpsc::SendError<(Point, f32)>> {
+        self.circle_tx.send((pos, radius))
     }
 }
