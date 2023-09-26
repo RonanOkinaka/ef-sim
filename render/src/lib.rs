@@ -1,152 +1,113 @@
-//! Defines a small, simplified wrapper over a Winit window.
+//! Re-export the relevant (i.e. public) parts of modules from this workspace.
 
-use raw_window_handle::{
-    HasRawDisplayHandle, HasRawWindowHandle, RawDisplayHandle, RawWindowHandle,
-};
-use std::default::Default;
-use winit::{
-    dpi::PhysicalSize,
-    event::{ElementState, Event, MouseButton, WindowEvent},
-    event_loop::EventLoop,
-    window::{Window as WinitWindow, WindowBuilder},
-};
+mod compute_shader;
+mod line;
+mod shader;
+mod window;
 
-/// Simplified cursor model containing its position and three major button states.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct MouseData {
-    pub left_down: bool,
-    pub right_down: bool,
-    pub middle_down: bool,
-    pub x: f32,
-    pub y: f32,
-}
+pub use line::*;
+pub use window::*;
 
-pub struct Window {
-    ev_loop: EventLoop<()>,
-    window: WinitWindow,
-    cursor: MouseData,
-}
+use pollster::block_on;
+use util::math::Point;
 
-/// We simply re-export Winit's virtual keyboard enum.
-pub use winit::event::VirtualKeyCode;
+async fn run_async() -> ! {
+    let window = Window::with_size("This Should Work...", 640, 480);
 
-#[derive(Clone, Copy, Debug)]
-pub enum InputEventType {
-    MouseMoved,
-    MouseLeft,
-    MouseMiddle,
-    MouseRight,
-    KeyboardButton(bool, VirtualKeyCode),
-}
+    // TODO: Hard-coded for now
+    let (mx, my): (f32, f32) = (2. / 640., 2. / 480.);
 
-#[derive(Clone, Copy, Debug)]
-pub struct InputEvent {
-    pub reason: InputEventType,
-    pub cursor: MouseData,
-}
+    let instance = wgpu::Instance::default();
 
-impl Window {
-    pub fn run<F1, F2>(mut self, mut on_redraw: F1, mut on_input: F2) -> !
-    where
-        F1: FnMut() + 'static,
-        F2: FnMut(InputEvent) + 'static,
-    {
-        self.ev_loop.run(move |event, _, control_flow| {
-            control_flow.set_wait();
+    // Unfortunate but unavoidable
+    let surface = unsafe { instance.create_surface(&window) }.unwrap();
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: Some(&surface),
+        })
+        .await
+        .expect("Failed to find an appropriate adapter");
 
-            match event {
-                Event::RedrawRequested(window_id) if window_id == self.window.id() => on_redraw(),
-                Event::WindowEvent { window_id, event } if window_id == self.window.id() => {
-                    match event {
-                        WindowEvent::CloseRequested => control_flow.set_exit(),
-                        // Everything below this is just input translation
-                        WindowEvent::MouseInput { state, button, .. } => {
-                            let pressed = state == ElementState::Pressed;
-                            let mouse_button;
+    // Create the logical device and command queue
+    let (device, queue) = adapter
+        .request_device(
+            &wgpu::DeviceDescriptor {
+                label: None,
+                features: wgpu::Features::empty(),
+                limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
+            },
+            None,
+        )
+        .await
+        .expect("Failed to create device");
 
-                            match button {
-                                MouseButton::Left => {
-                                    self.cursor.left_down = pressed;
-                                    mouse_button = InputEventType::MouseLeft;
-                                }
-                                MouseButton::Middle => {
-                                    self.cursor.middle_down = pressed;
-                                    mouse_button = InputEventType::MouseMiddle;
-                                }
-                                MouseButton::Right => {
-                                    self.cursor.right_down = pressed;
-                                    mouse_button = InputEventType::MouseRight;
-                                }
-                                _ => return,
-                            }
+    let (width, height) = window.get_size();
+    let swapchain_capabilities = surface.get_capabilities(&adapter);
+    let swapchain_format = swapchain_capabilities.formats[0];
 
-                            on_input(InputEvent {
-                                reason: mouse_button,
-                                cursor: self.cursor,
-                            });
+    let config = wgpu::SurfaceConfiguration {
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        format: swapchain_format,
+        width,
+        height,
+        present_mode: wgpu::PresentMode::Fifo,
+        alpha_mode: swapchain_capabilities.alpha_modes[0],
+        view_formats: vec![],
+    };
+
+    surface.configure(&device, &config);
+
+    let (sender, mut renderer) = line_renderer(&device, &adapter, &surface);
+    let mut curve_index = 0;
+
+    window.run(
+        move || {
+            let curr_frame = surface
+                .get_current_texture()
+                .expect("Failed to retrieve swapchain texture");
+            let frame_view = curr_frame
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
+
+            renderer.render(&device, &queue, &frame_view);
+
+            curr_frame.present();
+        },
+        move |input_event| {
+            match input_event.reason {
+                InputEventType::MouseLeft => {
+                    let cursor = input_event.cursor;
+                    if cursor.left_down {
+                        let pos = Point(cursor.x * mx - 1.0, 1.0 - cursor.y * my);
+                        sender
+                            .push_point(pos, curve_index)
+                            .expect("Render thread should never hang up");
+                    }
+                }
+                InputEventType::KeyboardButton(true, key) => {
+                    match key {
+                        // TODO: This could probably be a map and a macro...
+                        VirtualKeyCode::Key1 => curve_index = 0,
+                        VirtualKeyCode::Key2 => curve_index = 1,
+                        VirtualKeyCode::Key3 => curve_index = 2,
+                        VirtualKeyCode::Key4 => curve_index = 3,
+                        VirtualKeyCode::Key5 => curve_index = 4,
+                        VirtualKeyCode::Space => {
+                            sender
+                                .pop_point(curve_index)
+                                .expect("Render thread should never hang up");
                         }
-                        WindowEvent::CursorMoved { position, .. } => {
-                            self.cursor.x = position.x as f32;
-                            self.cursor.y = position.y as f32;
-
-                            on_input(InputEvent {
-                                reason: InputEventType::MouseMoved,
-                                cursor: self.cursor,
-                            });
-                        }
-                        WindowEvent::KeyboardInput { input, .. } => {
-                            if let Some(key) = input.virtual_keycode {
-                                let pressed = input.state == ElementState::Pressed;
-                                on_input(InputEvent {
-                                    reason: InputEventType::KeyboardButton(pressed, key),
-                                    cursor: self.cursor,
-                                });
-                            }
-                        }
-                        _ => {} // TODO: Must implement window resizing for the renderer
+                        _ => {}
                     }
                 }
                 _ => {}
             }
-        });
-    }
-
-    // Note: I hope to support WASM later, hence the config attribute
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn with_size<T>(title: T, width: u32, height: u32) -> Self
-    where
-        T: Into<String>,
-    {
-        let ev_loop = EventLoop::new();
-        let window = WindowBuilder::new()
-            .with_title(title)
-            .with_inner_size(PhysicalSize { width, height })
-            .build(&ev_loop)
-            .expect("Window creation failed");
-
-        Self {
-            ev_loop,
-            window,
-            cursor: Default::default(),
-        }
-    }
-
-    pub fn get_size(&self) -> (u32, u32) {
-        let size = self.window.inner_size();
-        (size.width, size.height)
-    }
+        },
+    );
 }
 
-/// Facilitates interop with WGPU
-unsafe impl HasRawDisplayHandle for Window {
-    fn raw_display_handle(&self) -> RawDisplayHandle {
-        self.window.raw_display_handle()
-    }
-}
-
-/// Facilitates interop with WGPU
-unsafe impl HasRawWindowHandle for Window {
-    fn raw_window_handle(&self) -> RawWindowHandle {
-        self.window.raw_window_handle()
-    }
+pub fn run() -> ! {
+    block_on(run_async());
 }
