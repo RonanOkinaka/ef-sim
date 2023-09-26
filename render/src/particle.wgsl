@@ -8,8 +8,12 @@ struct Charge {
 }
 
 struct ChargeBuffer {
-    size: vec4<i32>,
+    size: vec4<u32>,
     data: array<Charge, $$CHARGE_BUF_LOGICAL_SIZE$$>,
+}
+
+struct Params {
+    rand_value: u32,
 }
 
 
@@ -28,6 +32,9 @@ struct ChargeBuffer {
 /// Index buffer.
 @group(0) @binding(4) var<storage, read_write> indices: IndexBuffer;
 
+/// Helper data from CPU.
+@group(0) @binding(5) var<uniform> params: Params;
+
 
 @compute
 @workgroup_size($$WORKGROUP_SIZE_X$$)
@@ -41,22 +48,37 @@ fn particle_main(@builtin(global_invocation_id) global_invocation_id: vec3<u32>)
     var alive = bool(state.curves.data[curve_index].alive);
     var num_points = state.curves.data[curve_index].num_points;
 
-    // TODO: If we have no head, create a new point near an existing particle
+    var pos = vec2<f32>(0.0, 0.0);
+
     if (head_index < 0) {
-        return;
+        // TODO: We can do much better than this
+        let rand = (params.rand_value ^ curve_index);
+        let charge_index = rand % charges.size.x;
+
+        // The trig functions seem to struggle with large values, so reduce them
+        let angle = f32(rand % 2097152u);
+
+        let offset = $$CHARGE_COLLISION_RADIUS$$ * vec2<f32>(cos(angle), sin(angle));
+        pos = charges.data[charge_index].pos + offset;
+
+        // Reset the curve
+        if (charges.data[charge_index].charge > 0.0) {
+            alive = true;
+            state.curves.data[curve_index] = Curve(-1, -1, 0, 1);
+        } else {
+            alive = false;
+        }
     }
-
-    // TODO: Move head position into curve data? Can potentially benefit here and in push_vertex
-    var pos = vertices.data[head_index].pos;
-
     // Calculate our next value
-    if (alive) {
+    else if (alive) {
+        // TODO: Move head position into curve data? Can potentially benefit here and in push_vertex
+        pos = vertices.data[head_index].pos;
         var ds = vec2<f32>(0.0, 0.0);
-        for (var i: i32; i < charges.size.x; i += 1) {
+        for (var i = 0u; i < charges.size.x; i += 1u) {
             let ray = pos - charges.data[i].pos;
             var mag = length(ray);
 
-            if (mag < $$CHARGE_COLLISION_RADIUS$$) {
+            if (mag + 0.05 < $$CHARGE_COLLISION_RADIUS$$) {
                 alive = false;
                 break;
             }

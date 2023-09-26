@@ -1,6 +1,7 @@
 //! Define the type responsible for rendering lines.
 
 use bytemuck::{cast_slice, cast_slice_mut, Pod, Zeroable};
+use rand::Rng;
 use std::collections::HashMap;
 use std::sync::mpsc;
 use util::math::Point;
@@ -18,6 +19,7 @@ pub struct ParticleRenderer {
     render_bundle: wgpu::RenderBundle,
 
     num_charges: u32,
+    param_buf: wgpu::Buffer,
     charge_buf: wgpu::Buffer,
     compute_particle: ComputePipeline,
 
@@ -74,6 +76,12 @@ struct Charge {
     pos: Point,
     charge: f32,
     _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct Params {
+    rand_value: u32,
 }
 
 pub fn particle_renderer(
@@ -168,7 +176,16 @@ impl Renderer for ParticleRenderer {
             ]),
         );
 
-        self.compute_particle.run(&mut encoder, 1);
+        // Write the compute parameters
+        queue.write_buffer(
+            &self.param_buf,
+            0,
+            cast_slice(&[Params {
+                rand_value: rand::thread_rng().gen(),
+            }]),
+        );
+
+        self.compute_particle.run(&mut encoder, 1000);
         self.compute_pop_curve
             .run_indirect(&mut encoder, &self.compute_pop_buf, 0);
 
@@ -265,12 +282,12 @@ impl ParticleRenderer {
                 .slice(..(INDIRECT_DRAW_SIZE as u64))
                 .get_mapped_range_mut();
             cast_slice_mut(&mut curve_slice).copy_from_slice(bytemuck::cast_slice::<u32, u8>(&[
-                0, // # indices
-                1, // # instances (1, always)
-                0, // Index buffer offset
-                0, // Vertex buffer offset
-                0, // Instance offset
-                1, // Curve buffer size
+                0,    // # indices
+                1,    // # instances (1, always)
+                0,    // Index buffer offset
+                0,    // Vertex buffer offset
+                0,    // Instance offset
+                1000, // Curve buffer size
             ]));
 
             let mut curve_slice = state_buf
@@ -406,6 +423,12 @@ impl ParticleRenderer {
             device.limits().max_uniform_buffer_binding_size,
         );
 
+        let param_buf = create_buffer_with_size(
+            device,
+            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            std::mem::size_of::<Params>() as u32,
+        );
+
         let compute_particle_shader =
             shader_loader.create_shader(device, include_str!("particle.wgsl"));
 
@@ -417,6 +440,7 @@ impl ParticleRenderer {
                 ComputePipelineBuffer::Storage(&compute_pop_buf),
                 ComputePipelineBuffer::Storage(&vertex_buf),
                 ComputePipelineBuffer::Storage(&index_buf),
+                ComputePipelineBuffer::Uniform(&param_buf),
             ],
             compute_particle_shader,
             "particle_main",
@@ -429,6 +453,7 @@ impl ParticleRenderer {
             render_pipeline,
             render_bundle,
             num_charges: 0,
+            param_buf,
             charge_buf,
             compute_particle,
             compute_push_buf,
