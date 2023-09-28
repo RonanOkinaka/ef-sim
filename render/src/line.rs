@@ -34,6 +34,11 @@ pub struct ParticleRenderer {
     target_num_curves: Arc<AtomicU32>,
     current_num_curves: u32,
 
+    start_time: std::time::Instant,
+    last_frame: f32,
+    // Gross hack required due to lack of atomic f32 support
+    particle_lifetime_s: Arc<AtomicU32>,
+
     max_push_per_frame: u32,
     max_pops_per_frame: u32,
     max_num_points: u32,
@@ -46,6 +51,7 @@ pub struct ParticleRenderer {
 pub struct ParticleSender {
     charge_tx: mpsc::Sender<Charge>,
     target_num_curves: Arc<AtomicU32>,
+    particle_lifetime_s: Arc<AtomicU32>,
 }
 
 #[repr(C)]
@@ -68,6 +74,7 @@ struct Curve {
     head_index: i32,
     tail_index: i32,
     num_points: i32,
+    lifetime: f32,
 }
 
 #[repr(C)]
@@ -82,6 +89,8 @@ struct Charge {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Params {
     rand_value: u32,
+    tick_s: f32,
+    particle_lifetime_s: f32,
 }
 
 pub fn particle_renderer(
@@ -91,6 +100,7 @@ pub fn particle_renderer(
 ) -> (ParticleSender, ParticleRenderer) {
     let (charge_tx, charge_rx) = mpsc::channel();
     let target_num_curves = Arc::new(AtomicU32::new(0));
+    let particle_lifetime_s = Arc::new(AtomicU32::new(10.0f32.to_bits()));
 
     let renderer = ParticleRenderer::with_channel(
         device,
@@ -98,12 +108,14 @@ pub fn particle_renderer(
         surface,
         charge_rx,
         target_num_curves.clone(),
+        particle_lifetime_s.clone(),
     );
 
     (
         ParticleSender {
             charge_tx,
             target_num_curves,
+            particle_lifetime_s,
         },
         renderer,
     )
@@ -156,13 +168,20 @@ impl Renderer for ParticleRenderer {
         );
 
         // Write the compute parameters
+        let elapsed = self.start_time.elapsed();
+        let now = elapsed.as_secs_f32();
+
+        let particle_lifetime_s = f32::from_bits(self.particle_lifetime_s.load(Ordering::Relaxed));
         queue.write_buffer(
             &self.param_buf,
             0,
             cast_slice(&[Params {
                 rand_value: rand::thread_rng().gen(),
+                tick_s: now - self.last_frame,
+                particle_lifetime_s,
             }]),
         );
+        self.last_frame = now;
 
         let target_num_curves = self.target_num_curves.load(Ordering::Relaxed);
         if target_num_curves != self.current_num_curves {
@@ -208,6 +227,7 @@ impl ParticleRenderer {
         surface: &wgpu::Surface,
         charge_rx: mpsc::Receiver<Charge>,
         target_num_curves: Arc<AtomicU32>,
+        particle_lifetime_s: Arc<AtomicU32>,
     ) -> Self {
         // Smaller between the default and max size for a storage buffer
         let default_buffer_size = device
@@ -233,7 +253,7 @@ impl ParticleRenderer {
         // The curves get one half [without the indirect draw buffer]
         let curve_buf_size_bytes = (default_buffer_size) / 2 - CURVE_PRELUDE_SIZE;
 
-        // And each one is 12 bytes
+        // And each one is 16 bytes
         let max_num_curves = curve_buf_size_bytes / CURVE_SIZE;
 
         // Each free list gets one quarter (4), and each element is 4 bytes
@@ -284,7 +304,12 @@ impl ParticleRenderer {
             let mut curve_slice = state_buf
                 .slice((CURVE_PRELUDE_SIZE as u64)..(curve_buf_size_bytes as u64))
                 .get_mapped_range_mut();
-            cast_slice_mut(&mut curve_slice).fill(-1);
+            cast_slice_mut(&mut curve_slice).fill(Curve {
+                head_index: -1,
+                tail_index: -1,
+                num_points: 0,
+                lifetime: 0.0,
+            });
         }
         state_buf.unmap();
 
@@ -455,6 +480,9 @@ impl ParticleRenderer {
             charge_rx,
             target_num_curves,
             current_num_curves: 0,
+            start_time: std::time::Instant::now(),
+            last_frame: 0.0,
+            particle_lifetime_s,
             max_push_per_frame,
             max_pops_per_frame,
             max_num_points,
@@ -482,6 +510,11 @@ impl ParticleSender {
 
     pub fn set_num_curves(&self, num_curves: u32) {
         self.target_num_curves.store(num_curves, Ordering::Relaxed);
+    }
+
+    pub fn set_particle_lifetime(&self, lifetime_s: f32) {
+        self.particle_lifetime_s
+            .store(lifetime_s.to_bits(), Ordering::Relaxed);
     }
 }
 

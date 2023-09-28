@@ -14,6 +14,8 @@ struct ChargeBuffer {
 
 struct Params {
     rand_value: u32,
+    tick_s: f32,
+    particle_lifetime_s: f32,
 }
 
 
@@ -45,7 +47,7 @@ fn particle_main(@builtin(global_invocation_id) global_invocation_id: vec3<u32>)
     }
 
     let head_index = state.curves.data[curve_index].head_index;
-    var alive = bool(state.curves.data[curve_index].alive);
+    var lifetime = state.curves.data[curve_index].lifetime;
     var num_points = state.curves.data[curve_index].num_points;
 
     var pos = vec2<f32>(0.0, 0.0);
@@ -66,19 +68,19 @@ fn particle_main(@builtin(global_invocation_id) global_invocation_id: vec3<u32>)
 
             // Reset the curve
             if (charges.data[charge_index].charge > 0.0) {
-                alive = true;
-                state.curves.data[curve_index] = Curve(-1, -1, 0, 1);
+                lifetime = params.particle_lifetime_s;
+                state.curves.data[curve_index] = Curve(-1, -1, 0, lifetime);
             } else {
-                alive = false;
+                lifetime = 0.0;
                 atomicSub(&state.curves.size, 1);
             }
         } else {
-            alive = false;
+            lifetime = 0.0;
             atomicSub(&state.curves.size, 1);
         }
     }
     // Calculate our next value
-    else if (alive) {
+    else if (lifetime > 0.0) {
         // TODO: Move head position into curve data? Can potentially benefit here and in push_vertex
         pos = vertices.data[head_index].pos;
         var ds = vec2<f32>(0.0, 0.0);
@@ -87,7 +89,7 @@ fn particle_main(@builtin(global_invocation_id) global_invocation_id: vec3<u32>)
             var mag = length(ray);
 
             if (mag + 0.05 < $$CHARGE_COLLISION_RADIUS$$) {
-                alive = false;
+                lifetime = 0.0;
                 break;
             }
 
@@ -99,22 +101,27 @@ fn particle_main(@builtin(global_invocation_id) global_invocation_id: vec3<u32>)
         if (length(ds) > 0.001) {
             pos += normalize(ds) * 0.01;
         } else {
-            alive = false;
+            lifetime = 0.0;
         }
     }
 
-    if (alive) {
+    if (lifetime > 0.0) {
         // We'll push here instead of dispatching another shader for it
         let ret = push_vertex(pos, curve_index);
         num_points = ret.x;
-        alive = bool(ret.y);
+        if (!bool(ret.y)) {
+            lifetime = 0.0;
+        }
     }
 
     var should_pop = (num_points >= $$MAX_POINTS_PER_CURVE$$); // TODO: This should be dynamic
-    if (!alive) {
-        state.curves.data[curve_index].alive = 0;
+    if (lifetime <= 0.0) {
         should_pop |= bool(num_points);
+    } else {
+        lifetime -= params.tick_s;
     }
+
+    state.curves.data[curve_index].lifetime = lifetime;
 
     // Pops will stay separate, however, mostly for synchronization reasons
     if (should_pop) {

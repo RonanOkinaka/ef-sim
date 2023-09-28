@@ -27,7 +27,7 @@ struct Curve {
     head_index: i32,
     tail_index: i32,
     num_points: i32,
-    alive: i32,
+    lifetime: f32,
 }
 
 /// Buffer for all curves.
