@@ -2,6 +2,8 @@
 
 use bytemuck::{cast_slice, cast_slice_mut, Pod, Zeroable};
 use rand::Rng;
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::LinkedList;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{mpsc, Arc};
 use util::math::Point;
@@ -11,24 +13,16 @@ use crate::render_util::Renderer;
 use crate::shader::WgslLoader;
 
 /// State required for rendering lines.
-#[allow(dead_code)]
 pub struct ParticleRenderer {
-    vertex_buf: wgpu::Buffer,
-    index_buf: wgpu::Buffer,
-    render_pipeline: wgpu::RenderPipeline,
-    render_bundle: wgpu::RenderBundle,
+    // ParticleSubRenderer is very large and we really don't want to copy it
+    sub_renderers: LinkedList<ParticleSubRenderer>,
+
+    render_shader: wgpu::ShaderModule,
+    particle_shader: wgpu::ShaderModule,
+    pop_shader: wgpu::ShaderModule,
 
     num_charges: u32,
-    state_buf: wgpu::Buffer,
-    param_buf: wgpu::Buffer,
     charge_buf: wgpu::Buffer,
-    compute_particle: ComputePipeline,
-
-    compute_push_buf: wgpu::Buffer,
-    compute_push_curve: ComputePipeline,
-
-    compute_pop_buf: wgpu::Buffer,
-    compute_pop_curve: ComputePipeline,
 
     charge_rx: mpsc::Receiver<Charge>,
     target_num_curves: Arc<AtomicU32>,
@@ -39,11 +33,8 @@ pub struct ParticleRenderer {
     // Gross hack required due to lack of atomic f32 support
     particle_lifetime_s: Arc<AtomicU32>,
 
-    max_push_per_frame: u32,
-    max_pops_per_frame: u32,
-    max_num_points: u32,
-    max_num_curves: u32,
-    max_num_charges: u32,
+    format: wgpu::TextureFormat,
+    limits: ParticleBufferLimits,
 }
 
 /// State required for requesting a line be rendered.
@@ -52,6 +43,33 @@ pub struct ParticleSender {
     charge_tx: mpsc::Sender<Charge>,
     target_num_curves: Arc<AtomicU32>,
     particle_lifetime_s: Arc<AtomicU32>,
+}
+
+struct ParticleSubRenderer {
+    render_bundle: wgpu::RenderBundle,
+
+    state_buf: wgpu::Buffer,
+    param_buf: wgpu::Buffer,
+    compute_particle: ComputePipeline,
+
+    compute_pop_buf: wgpu::Buffer,
+    compute_pop_curve: ComputePipeline,
+
+    target_num_curves: u32,
+    current_num_curves: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ParticleBufferLimits {
+    #[allow(dead_code)]
+    max_num_points: u32,
+    max_num_curves: u32,
+    max_num_charges: u32,
+
+    default_buffer_size: u32,
+    curve_buf_size_bytes: u32,
+
+    workgroup_size_x: u32,
 }
 
 #[repr(C)]
@@ -135,6 +153,9 @@ const CURVE_PRELUDE_SIZE: u32 = INDIRECT_DRAW_SIZE + 3 * 4;
 const INDIRECT_DISPATCH_SIZE: u32 = 3 * 4;
 const CHARGE_SIZE: u32 = 4 * 4;
 
+const MAX_POINTS_PER_CURVE: u32 = 10;
+const CHARGE_COLLISION_RADIUS: f32 = 0.1;
+
 impl Renderer for ParticleRenderer {
     fn render(
         &mut self,
@@ -142,62 +163,76 @@ impl Renderer for ParticleRenderer {
         queue: &wgpu::Queue,
         frame_view: &wgpu::TextureView,
     ) -> wgpu::CommandBuffer {
-        let mut encoder =
-            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-
-        let charges: Vec<Charge> = self.charge_rx.try_iter().collect();
+        // Write the charge buffer
+        let charges: Vec<Charge> = self
+            .charge_rx
+            .try_iter()
+            .take((self.limits.max_num_charges - self.num_charges) as usize)
+            .collect();
         queue.write_buffer(
             &self.charge_buf,
             ((self.num_charges + 1) * CHARGE_SIZE).into(),
             cast_slice(charges.as_slice()),
         );
 
+        // Update the charge counts
         self.num_charges += charges.len() as u32;
         queue.write_buffer(&self.charge_buf, 0, cast_slice(&[self.num_charges]));
 
-        // Reset the pop buffer and dispatch data
-        queue.write_buffer(
-            &self.compute_pop_buf,
-            0,
-            cast_slice::<u32, u8>(&[
-                1, // Pop workgroup x [It would be nice if this could be 0, but I'm not sure if that's allowed]
-                1, // Pop workgroup y
-                1, // Pop workgroup z
-                0, // # points to pop
-            ]),
-        );
+        // Change the number of sub-renderers as necessary
+        let target_num_curves = self.target_num_curves.load(Ordering::Relaxed);
 
-        // Write the compute parameters
+        match target_num_curves.cmp(&self.current_num_curves) {
+            CmpOrdering::Greater => {
+                self.increase_num_particles(target_num_curves - self.current_num_curves, device);
+            }
+            CmpOrdering::Less => {
+                self.decrease_num_particles(self.current_num_curves - target_num_curves);
+            }
+            CmpOrdering::Equal => {}
+        }
+        self.current_num_curves = target_num_curves;
+
+        // Generate the compute parameters
         let elapsed = self.start_time.elapsed();
         let now = elapsed.as_secs_f32();
-
-        let particle_lifetime_s = f32::from_bits(self.particle_lifetime_s.load(Ordering::Relaxed));
-        queue.write_buffer(
-            &self.param_buf,
-            0,
-            cast_slice(&[Params {
-                rand_value: rand::thread_rng().gen(),
-                tick_s: now - self.last_frame,
-                particle_lifetime_s,
-            }]),
-        );
+        let params = Params {
+            rand_value: 0,
+            tick_s: now - self.last_frame,
+            particle_lifetime_s: f32::from_bits(self.particle_lifetime_s.load(Ordering::Relaxed)),
+        };
         self.last_frame = now;
 
-        let target_num_curves = self.target_num_curves.load(Ordering::Relaxed);
-        if target_num_curves != self.current_num_curves {
-            self.current_num_curves = self.current_num_curves.max(target_num_curves);
-            queue.write_buffer(
-                &self.state_buf,
-                INDIRECT_DRAW_SIZE.into(),
-                cast_slice(&[self.current_num_curves, target_num_curves]),
-            );
+        // Prepare our command encoder
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
+        // Order matters here! First, update our particles
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
+
+            for part_renderer in self.sub_renderers.iter_mut() {
+                part_renderer.do_particle_pass(
+                    queue,
+                    &mut pass,
+                    Params {
+                        rand_value: rand::thread_rng().gen(),
+                        ..params
+                    },
+                );
+            }
         }
 
-        self.compute_particle
-            .run(&mut encoder, self.current_num_curves);
-        self.compute_pop_curve
-            .run_indirect(&mut encoder, &self.compute_pop_buf, 0);
+        // Next, pop points as necessary
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
 
+            for part_renderer in self.sub_renderers.iter_mut() {
+                part_renderer.do_pop_pass(&mut pass);
+            }
+        }
+
+        // Finally, draw!
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
@@ -212,7 +247,9 @@ impl Renderer for ParticleRenderer {
                 depth_stencil_attachment: None,
             });
 
-            pass.execute_bundles([&self.render_bundle]);
+            for part_renderer in self.sub_renderers.iter_mut() {
+                part_renderer.do_render_pass(&mut pass);
+            }
         }
 
         encoder.finish()
@@ -220,7 +257,6 @@ impl Renderer for ParticleRenderer {
 }
 
 impl ParticleRenderer {
-    /// Create a new ParticleRenderer given a device, adapter and surface.
     fn with_channel(
         device: &wgpu::Device,
         adapter: &wgpu::Adapter,
@@ -235,11 +271,13 @@ impl ParticleRenderer {
             .max_storage_buffer_binding_size
             .min(DEFAULT_BUFFER_SIZE);
 
-        // Create the index and vertex buffers
-        let vertex_buf =
-            create_buffer_with_size(device, wgpu::BufferUsages::VERTEX, default_buffer_size);
-        let index_buf =
-            create_buffer_with_size(device, wgpu::BufferUsages::INDEX, default_buffer_size);
+        // Each free list gets one quarter (4), and each element is 4 bytes
+        // Also, subtract out the size indicator
+        let free_list_stack_size = (default_buffer_size / 4 / INDEX_SIZE) - 1;
+
+        let max_num_points = free_list_stack_size // No more points than positions in free list
+            .min(default_buffer_size / 2 / VERTEX_SIZE - 1) // One point is represented by 2 vertices
+            .min(default_buffer_size / QUAD_INDEX_SIZE - 1); // One quad set is 6x 4-byte integers
 
         // Common shader data
         let mut shader_loader = WgslLoader::new();
@@ -254,24 +292,30 @@ impl ParticleRenderer {
         let curve_buf_size_bytes = (default_buffer_size) / 2 - CURVE_PRELUDE_SIZE;
 
         // And each one is 16 bytes
-        let max_num_curves = curve_buf_size_bytes / CURVE_SIZE;
+        let curve_buf_size = curve_buf_size_bytes / CURVE_SIZE;
 
-        // Each free list gets one quarter (4), and each element is 4 bytes
-        // Also, subtract out the size indicator
-        let free_list_stack_size = (default_buffer_size / 4 / INDEX_SIZE) - 1;
+        // Useful approximation to prevent buffer overruns
+        let max_num_curves = curve_buf_size.min(max_num_points / (MAX_POINTS_PER_CURVE + 1));
 
         // Charge buffer size
         let charge_buf_size_bytes = device.limits().max_uniform_buffer_binding_size.min(16384);
         let max_num_charges = charge_buf_size_bytes / CHARGE_SIZE - 1;
 
+        // Texture format
+        let format = surface.get_capabilities(adapter).formats[0];
+
+        // Load the shaders
         shader_loader.bind("PUSH_BUF_LOGICAL_SIZE", max_push_per_frame.to_string());
         shader_loader.bind("POP_BUF_LOGICAL_SIZE", max_pops_per_frame.to_string());
-        shader_loader.bind("CURVE_BUF_LOGICAL_SIZE", max_num_curves.to_string());
+        shader_loader.bind("CURVE_BUF_LOGICAL_SIZE", curve_buf_size.to_string());
         shader_loader.bind("FREE_LIST_LOGICAL_SIZE", free_list_stack_size.to_string());
         shader_loader.bind("CHARGE_BUF_LOGICAL_SIZE", max_num_charges.to_string());
 
-        shader_loader.bind("MAX_POINTS_PER_CURVE", "10".to_owned());
-        shader_loader.bind("CHARGE_COLLISION_RADIUS", "0.1".to_owned());
+        shader_loader.bind("MAX_POINTS_PER_CURVE", MAX_POINTS_PER_CURVE.to_string());
+        shader_loader.bind(
+            "CHARGE_COLLISION_RADIUS",
+            CHARGE_COLLISION_RADIUS.to_string(),
+        );
 
         shader_loader.add_common_source(include_str!("common.wgsl"));
         shader_loader.bind(
@@ -279,11 +323,177 @@ impl ParticleRenderer {
             include_str!("push_common.wgsl").to_owned(),
         );
 
+        let workgroup_size_x = 256.min(device.limits().max_compute_workgroup_size_x);
+        shader_loader.bind("WORKGROUP_SIZE_X", workgroup_size_x.to_string());
+
+        let render_shader = shader_loader.create_shader(device, include_str!("draw_line.wgsl"));
+        let particle_shader = shader_loader.create_shader(device, include_str!("particle.wgsl"));
+        let pop_shader = shader_loader.create_shader(device, include_str!("pop_curve.wgsl"));
+
+        // Create the charge buffer
+        let charge_buf = create_buffer_with_size(
+            device,
+            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            device.limits().max_uniform_buffer_binding_size,
+        );
+
+        println!(
+            "{:#?}",
+            ParticleBufferLimits {
+                max_num_points,
+                max_num_curves,
+                max_num_charges,
+                default_buffer_size,
+                curve_buf_size_bytes,
+                workgroup_size_x,
+            }
+        );
+
+        Self {
+            sub_renderers: LinkedList::new(),
+            num_charges: 0,
+            charge_buf,
+            charge_rx,
+            target_num_curves,
+            current_num_curves: 0,
+            start_time: std::time::Instant::now(),
+            last_frame: 0.0,
+            particle_lifetime_s,
+            render_shader,
+            particle_shader,
+            pop_shader,
+            format,
+            limits: ParticleBufferLimits {
+                max_num_points,
+                max_num_curves,
+                max_num_charges,
+                default_buffer_size,
+                curve_buf_size_bytes,
+                workgroup_size_x,
+            },
+        }
+    }
+
+    fn increase_num_particles(&mut self, mut new_curves_required: u32, device: &wgpu::Device) {
+        // First, try to fill the last one
+        if let Some(sub_renderer) = self.sub_renderers.back_mut() {
+            let diff = (self.limits.max_num_curves - sub_renderer.current_num_curves)
+                .min(new_curves_required);
+
+            sub_renderer.target_num_curves += diff;
+            new_curves_required -= diff;
+        }
+
+        // Now, start making new sub-renderers
+        while new_curves_required > 0 {
+            let diff = new_curves_required.min(self.limits.max_num_curves);
+            new_curves_required -= diff;
+
+            self.sub_renderers.push_back(ParticleSubRenderer::new(
+                device,
+                self.format,
+                diff,
+                self.limits,
+                &self.render_shader,
+                &self.particle_shader,
+                &self.pop_shader,
+                &self.charge_buf,
+            ));
+        }
+    }
+
+    fn decrease_num_particles(&mut self, mut num_curves_deleted: u32) {
+        // Pop back to front
+        let mut sub_render_iter = self.sub_renderers.iter_mut().rev();
+
+        while num_curves_deleted > 0 {
+            let sub_renderer = sub_render_iter.next().expect("Miscounted active");
+
+            let diff = num_curves_deleted.min(sub_renderer.current_num_curves);
+
+            sub_renderer.target_num_curves -= diff;
+            num_curves_deleted -= diff;
+        }
+
+        // TODO: Write a compaction shader to reduce the number of drawn indices and
+        // active curves when their numbers are reduced
+    }
+}
+
+impl ParticleSubRenderer {
+    fn do_particle_pass<'a>(
+        &'a mut self,
+        queue: &wgpu::Queue,
+        pass: &mut wgpu::ComputePass<'a>,
+        params: Params,
+    ) {
+        // Reset the pop buffer and dispatch data
+        queue.write_buffer(
+            &self.compute_pop_buf,
+            0,
+            cast_slice::<u32, u8>(&[
+                1, // Pop workgroup x [It would be nice if this could be 0, but I'm not sure if that's allowed]
+                1, // Pop workgroup y
+                1, // Pop workgroup z
+                0, // # points to pop
+            ]),
+        );
+
+        // Write the compute parameters
+        queue.write_buffer(&self.param_buf, 0, cast_slice(&[params]));
+
+        // Update the curve buffer size as necessary
+        if self.target_num_curves != self.current_num_curves {
+            self.current_num_curves = self.current_num_curves.max(self.target_num_curves);
+            queue.write_buffer(
+                &self.state_buf,
+                INDIRECT_DRAW_SIZE.into(),
+                cast_slice(&[self.current_num_curves, self.target_num_curves]),
+            );
+        }
+
+        // Compute
+        self.compute_particle
+            .run_shared(pass, self.current_num_curves);
+    }
+
+    fn do_pop_pass<'a>(&'a mut self, pass: &mut wgpu::ComputePass<'a>) {
+        self.compute_pop_curve
+            .run_indirect_shared(pass, &self.compute_pop_buf, 0);
+    }
+
+    fn do_render_pass<'a>(&'a mut self, pass: &mut wgpu::RenderPass<'a>) {
+        pass.execute_bundles([&self.render_bundle]);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        target_num_curves: u32,
+        limits: ParticleBufferLimits,
+        render_shader: &wgpu::ShaderModule,
+        particle_shader: &wgpu::ShaderModule,
+        pop_shader: &wgpu::ShaderModule,
+        charge_buf: &wgpu::Buffer,
+    ) -> Self {
+        // Create the index and vertex buffers
+        let vertex_buf = create_buffer_with_size(
+            device,
+            wgpu::BufferUsages::VERTEX,
+            limits.default_buffer_size,
+        );
+        let index_buf = create_buffer_with_size(
+            device,
+            wgpu::BufferUsages::INDEX,
+            limits.default_buffer_size,
+        );
+
         // Create the state buffer
         let state_buf = create_buffer_with_size_mapped(
             device,
             wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::INDIRECT,
-            default_buffer_size,
+            limits.default_buffer_size,
             true,
         );
         {
@@ -302,7 +512,7 @@ impl ParticleRenderer {
             ]));
 
             let mut curve_slice = state_buf
-                .slice((CURVE_PRELUDE_SIZE as u64)..(curve_buf_size_bytes as u64))
+                .slice((CURVE_PRELUDE_SIZE as u64)..(limits.curve_buf_size_bytes as u64))
                 .get_mapped_range_mut();
             cast_slice_mut(&mut curve_slice).fill(Curve {
                 head_index: -1,
@@ -312,9 +522,6 @@ impl ParticleRenderer {
             });
         }
         state_buf.unmap();
-
-        // Render shader
-        let render_shader = shader_loader.create_shader(device, include_str!("draw_line.wgsl"));
 
         // Describe and create the render pipeline
         let render_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -327,7 +534,7 @@ impl ParticleRenderer {
             label: None,
             layout: Some(&render_layout),
             vertex: wgpu::VertexState {
-                module: &render_shader,
+                module: render_shader,
                 entry_point: "vertex_main",
                 buffers: &[wgpu::VertexBufferLayout {
                     array_stride: VERTEX_SIZE as u64,
@@ -341,7 +548,7 @@ impl ParticleRenderer {
                 }],
             },
             fragment: Some(wgpu::FragmentState {
-                module: &render_shader,
+                module: render_shader,
                 entry_point: "fragment_main",
                 targets: &[Some(wgpu::ColorTargetState {
                     blend: Some(wgpu::BlendState {
@@ -352,7 +559,7 @@ impl ParticleRenderer {
                         },
                         alpha: wgpu::BlendComponent::OVER,
                     }),
-                    ..surface.get_capabilities(adapter).formats[0].into()
+                    ..format.into()
                 })],
             }),
             primitive: wgpu::PrimitiveState::default(),
@@ -365,7 +572,7 @@ impl ParticleRenderer {
         let mut render_bundle_encoder =
             device.create_render_bundle_encoder(&wgpu::RenderBundleEncoderDescriptor {
                 label: None,
-                color_formats: &[Some(surface.get_capabilities(adapter).formats[0])],
+                color_formats: &[Some(format)],
                 depth_stencil: None,
                 sample_count: wgpu::MultisampleState::default().count,
                 multiview: None,
@@ -379,35 +586,11 @@ impl ParticleRenderer {
         let render_bundle =
             render_bundle_encoder.finish(&wgpu::RenderBundleDescriptor { label: None });
 
-        // General compute data
-        let workgroup_size_x = 256;
-        shader_loader.bind("WORKGROUP_SIZE_X", workgroup_size_x.to_string());
-
-        // Describe and create the push pipeline
-        let compute_push_buf =
-            create_buffer_with_size(device, wgpu::BufferUsages::COPY_DST, default_buffer_size);
-
-        let push_curve_shader =
-            shader_loader.create_shader(device, include_str!("push_curve.wgsl"));
-
-        let compute_push_curve = ComputePipeline::new(
-            device,
-            &[
-                ComputePipelineBuffer::Storage(&compute_push_buf),
-                ComputePipelineBuffer::Storage(&vertex_buf),
-                ComputePipelineBuffer::Storage(&index_buf),
-                ComputePipelineBuffer::Storage(&state_buf),
-            ],
-            push_curve_shader,
-            "push_curve_main",
-            workgroup_size_x,
-        );
-
         // Describe and create the pop pipeline
         let compute_pop_buf = create_buffer_with_size(
             device,
             wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::INDIRECT,
-            default_buffer_size,
+            limits.default_buffer_size,
         );
 
         let compute_pop_curve = ComputePipeline::new(
@@ -418,76 +601,42 @@ impl ParticleRenderer {
                 ComputePipelineBuffer::Storage(&index_buf),
                 ComputePipelineBuffer::Storage(&state_buf),
             ],
-            shader_loader.create_shader(device, include_str!("pop_curve.wgsl")),
+            pop_shader,
             "pop_curve_main",
-            workgroup_size_x,
-        );
-
-        let max_num_points = free_list_stack_size // No more points than positions in free list
-            .min(vertex_buf.size() as u32 / 2 / VERTEX_SIZE - 1) // One point is represented by 2 vertices
-            .min(index_buf.size() as u32 / QUAD_INDEX_SIZE - 1); // One quad set is 6x 4-byte integers
-
-        println!(
-            "max push: {}\nmax pops: {}\nmax points: {}\nmax curves: {}",
-            max_push_per_frame, max_pops_per_frame, max_num_points, max_num_curves
+            limits.workgroup_size_x,
         );
 
         // Create the particle compute pipeline
-        let charge_buf = create_buffer_with_size(
-            device,
-            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            device.limits().max_uniform_buffer_binding_size,
-        );
-
         let param_buf = create_buffer_with_size(
             device,
             wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             std::mem::size_of::<Params>() as u32,
         );
 
-        let compute_particle_shader =
-            shader_loader.create_shader(device, include_str!("particle.wgsl"));
-
         let compute_particle = ComputePipeline::new(
             device,
             &[
                 ComputePipelineBuffer::Storage(&state_buf),
-                ComputePipelineBuffer::Uniform(&charge_buf),
+                ComputePipelineBuffer::Uniform(charge_buf),
                 ComputePipelineBuffer::Storage(&compute_pop_buf),
                 ComputePipelineBuffer::Storage(&vertex_buf),
                 ComputePipelineBuffer::Storage(&index_buf),
                 ComputePipelineBuffer::Uniform(&param_buf),
             ],
-            compute_particle_shader,
+            particle_shader,
             "particle_main",
-            workgroup_size_x,
+            limits.workgroup_size_x,
         );
 
         Self {
-            vertex_buf,
-            index_buf,
-            render_pipeline,
             render_bundle,
-            num_charges: 0,
             state_buf,
             param_buf,
-            charge_buf,
             compute_particle,
-            compute_push_buf,
-            compute_push_curve,
             compute_pop_buf,
             compute_pop_curve,
-            charge_rx,
             target_num_curves,
             current_num_curves: 0,
-            start_time: std::time::Instant::now(),
-            last_frame: 0.0,
-            particle_lifetime_s,
-            max_push_per_frame,
-            max_pops_per_frame,
-            max_num_points,
-            max_num_curves,
-            max_num_charges,
         }
     }
 }

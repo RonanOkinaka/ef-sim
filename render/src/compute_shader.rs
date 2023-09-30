@@ -7,17 +7,17 @@ pub struct ComputePipeline {
 }
 
 pub enum ComputePipelineBuffer<'a> {
-    #[allow(dead_code)]
     Uniform(&'a wgpu::Buffer),
     Storage(&'a wgpu::Buffer),
     StorageReadOnly(&'a wgpu::Buffer),
 }
 
+#[allow(dead_code)]
 impl ComputePipeline {
     pub fn new(
         device: &wgpu::Device,
         buffers: &[ComputePipelineBuffer],
-        shader: wgpu::ShaderModule,
+        shader: &wgpu::ShaderModule,
         entry_point: &str,
         workgroup_size_x: u32,
     ) -> Self {
@@ -103,7 +103,7 @@ impl ComputePipeline {
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: None,
             layout: Some(&pipeline_layout),
-            module: &shader,
+            module: shader,
             entry_point,
         });
 
@@ -115,13 +115,9 @@ impl ComputePipeline {
     }
 
     pub fn run(&self, encoder: &mut wgpu::CommandEncoder, invocations: u32) {
-        // Round up the number of workgroups
-        let num_work_groups = (invocations + self.workgroup_size_x - 1) / self.workgroup_size_x;
-
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &self.bind_group, &[]);
-        pass.dispatch_workgroups(num_work_groups, 1, 1);
+        self.bind_self(&mut pass);
+        self.run_shared(&mut pass, invocations);
     }
 
     pub fn run_indirect(
@@ -131,8 +127,30 @@ impl ComputePipeline {
         offset: u64,
     ) {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
+        self.bind_self(&mut pass);
+        self.run_indirect_shared(&mut pass, params, offset);
+    }
+
+    pub fn run_shared<'a>(&'a self, pass: &mut wgpu::ComputePass<'a>, invocations: u32) {
+        // Round up the number of workgroups
+        let num_work_groups = (invocations + self.workgroup_size_x - 1) / self.workgroup_size_x;
+
+        self.bind_self(pass);
+        pass.dispatch_workgroups(num_work_groups, 1, 1);
+    }
+
+    pub fn run_indirect_shared<'a>(
+        &'a self,
+        pass: &mut wgpu::ComputePass<'a>,
+        params: &'a wgpu::Buffer,
+        offset: u64,
+    ) {
+        self.bind_self(pass);
+        pass.dispatch_workgroups_indirect(params, offset);
+    }
+
+    fn bind_self<'a>(&'a self, pass: &mut wgpu::ComputePass<'a>) {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
-        pass.dispatch_workgroups_indirect(params, offset);
     }
 }

@@ -7,7 +7,7 @@ struct VertexOut {
 
 @vertex
 fn vertex_main(vertex: Vertex) -> VertexOut {
-    let scaled = vertex.ray * 0.01; // TODO: This should be a parameter!
+    let scaled = vertex.ray * 0.005; // TODO: This should be a parameter!
     return VertexOut(
         vec4<f32>(vertex.pos.x + scaled.x, vertex.pos.y + scaled.y, 0.0, 1.0),
         vec4<f32>(1.0, 0.0, 0.0, vertex.alpha)
