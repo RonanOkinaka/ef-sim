@@ -5,12 +5,13 @@ use rand::Rng;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::LinkedList;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::Arc;
 use util::math::Point;
 
 use crate::compute_shader::*;
 use crate::render_util::Renderer;
 use crate::shader::WgslLoader;
+use crate::update_queue::{UpdateQueue, UpdateResult};
 
 /// State required for rendering lines.
 pub struct ParticleRenderer {
@@ -21,10 +22,10 @@ pub struct ParticleRenderer {
     particle_shader: wgpu::ShaderModule,
     pop_shader: wgpu::ShaderModule,
 
-    num_charges: u32,
+    charge_updates: UpdateQueue<Charge>,
+    charge_vec: Vec<Charge>,
     charge_buf: wgpu::Buffer,
 
-    charge_rx: mpsc::Receiver<Charge>,
     target_num_curves: Arc<AtomicU32>,
     current_num_curves: u32,
 
@@ -40,7 +41,7 @@ pub struct ParticleRenderer {
 /// State required for requesting a line be rendered.
 #[derive(Clone)]
 pub struct ParticleSender {
-    charge_tx: mpsc::Sender<Charge>,
+    charge_updates: UpdateQueue<Charge>,
     target_num_curves: Arc<AtomicU32>,
     particle_lifetime_s: Arc<AtomicU32>,
 }
@@ -59,9 +60,9 @@ struct ParticleSubRenderer {
     current_num_curves: u32,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 struct ParticleBufferLimits {
-    #[allow(dead_code)]
     max_num_points: u32,
     max_num_curves: u32,
     max_num_charges: u32,
@@ -116,24 +117,13 @@ pub fn particle_renderer(
     adapter: &wgpu::Adapter,
     surface: &wgpu::Surface,
 ) -> (ParticleSender, ParticleRenderer) {
-    let (charge_tx, charge_rx) = mpsc::channel();
-    let target_num_curves = Arc::new(AtomicU32::new(0));
-    let particle_lifetime_s = Arc::new(AtomicU32::new(10.0f32.to_bits()));
-
-    let renderer = ParticleRenderer::with_channel(
-        device,
-        adapter,
-        surface,
-        charge_rx,
-        target_num_curves.clone(),
-        particle_lifetime_s.clone(),
-    );
+    let renderer = ParticleRenderer::new(device, adapter, surface);
 
     (
         ParticleSender {
-            charge_tx,
-            target_num_curves,
-            particle_lifetime_s,
+            charge_updates: renderer.charge_updates.clone(),
+            target_num_curves: renderer.target_num_curves.clone(),
+            particle_lifetime_s: renderer.particle_lifetime_s.clone(),
         },
         renderer,
     )
@@ -163,21 +153,8 @@ impl Renderer for ParticleRenderer {
         queue: &wgpu::Queue,
         frame_view: &wgpu::TextureView,
     ) -> wgpu::CommandBuffer {
-        // Write the charge buffer
-        let charges: Vec<Charge> = self
-            .charge_rx
-            .try_iter()
-            .take((self.limits.max_num_charges - self.num_charges) as usize)
-            .collect();
-        queue.write_buffer(
-            &self.charge_buf,
-            ((self.num_charges + 1) * CHARGE_SIZE).into(),
-            cast_slice(charges.as_slice()),
-        );
-
-        // Update the charge counts
-        self.num_charges += charges.len() as u32;
-        queue.write_buffer(&self.charge_buf, 0, cast_slice(&[self.num_charges]));
+        // Update charge buffer
+        self.update_charge_buffer(queue);
 
         // Change the number of sub-renderers as necessary
         let target_num_curves = self.target_num_curves.load(Ordering::Relaxed);
@@ -257,14 +234,7 @@ impl Renderer for ParticleRenderer {
 }
 
 impl ParticleRenderer {
-    fn with_channel(
-        device: &wgpu::Device,
-        adapter: &wgpu::Adapter,
-        surface: &wgpu::Surface,
-        charge_rx: mpsc::Receiver<Charge>,
-        target_num_curves: Arc<AtomicU32>,
-        particle_lifetime_s: Arc<AtomicU32>,
-    ) -> Self {
+    fn new(device: &wgpu::Device, adapter: &wgpu::Adapter, surface: &wgpu::Surface) -> Self {
         // Smaller between the default and max size for a storage buffer
         let default_buffer_size = device
             .limits()
@@ -351,14 +321,14 @@ impl ParticleRenderer {
 
         Self {
             sub_renderers: LinkedList::new(),
-            num_charges: 0,
+            charge_updates: UpdateQueue::with_limit(max_num_charges as usize),
+            charge_vec: Vec::new(),
             charge_buf,
-            charge_rx,
-            target_num_curves,
+            target_num_curves: Arc::new(AtomicU32::new(0)),
             current_num_curves: 0,
             start_time: std::time::Instant::now(),
             last_frame: 0.0,
-            particle_lifetime_s,
+            particle_lifetime_s: Arc::new(AtomicU32::new(10.0f32.to_bits())),
             render_shader,
             particle_shader,
             pop_shader,
@@ -417,6 +387,30 @@ impl ParticleRenderer {
 
         // TODO: Write a compaction shader to reduce the number of drawn indices and
         // active curves when their numbers are reduced
+    }
+
+    fn update_charge_buffer(&mut self, queue: &wgpu::Queue) {
+        match self.charge_updates.apply_updates(&mut self.charge_vec) {
+            UpdateResult::Range(min, max) => {
+                // Write the charge buffer
+                // This buffer shouldn't be very large, so copying the whole
+                // thing isn't a huge deal (TODO: segmented write algorithm?)
+                queue.write_buffer(
+                    &self.charge_buf,
+                    (min as u64 + 1) * CHARGE_SIZE as u64,
+                    cast_slice(&self.charge_vec[min..max]),
+                );
+            }
+            UpdateResult::SizeOnly(..) => {} // Only update the size
+            UpdateResult::Same => return,    // Early return if nothing happened
+        };
+
+        // Update the charge counts
+        queue.write_buffer(
+            &self.charge_buf,
+            0,
+            cast_slice(&[self.charge_vec.len() as u32]),
+        );
     }
 }
 
@@ -642,18 +636,23 @@ impl ParticleSubRenderer {
 }
 
 impl ParticleSender {
-    pub fn push_charge(
-        &self,
-        pos: Point,
-        charge: f32,
-    ) -> Result<(), mpsc::SendError<(Point, f32)>> {
-        match self.charge_tx.send(Charge {
+    pub fn push_charge(&self, pos: Point, charge: f32) -> Result<u32, (Point, f32)> {
+        let charge_data = Charge {
             pos,
             charge,
             _pad: 0,
-        }) {
-            Ok(..) => Ok(()),
-            Err(..) => Err(mpsc::SendError((pos, charge))),
+        };
+
+        match self.charge_updates.push(charge_data) {
+            Ok(index) => Ok(index as u32),
+            Err(..) => Err((pos, charge)),
+        }
+    }
+
+    pub fn pop_charge(&self, index: u32) -> Result<(), u32> {
+        match self.charge_updates.pop(index as usize) {
+            Ok(()) => Ok(()),
+            Err(..) => Err(index),
         }
     }
 

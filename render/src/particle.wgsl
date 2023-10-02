@@ -55,7 +55,7 @@ fn particle_main(@builtin(global_invocation_id) global_invocation_id: vec3<u32>)
     // Create a new curve
     if (head_index < 0) {
         // But only if we want it!
-        if (atomicAdd(&state.curves.size, 1) < state.curves.target_size) {
+        if (charges.size.x > 0u && atomicAdd(&state.curves.size, 1) < state.curves.target_size) {
             // TODO: We can do much better than this
             let rand = (params.rand_value ^ curve_index);
             let charge_index = rand % charges.size.x;

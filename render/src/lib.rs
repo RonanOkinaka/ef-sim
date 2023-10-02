@@ -5,6 +5,7 @@ mod compute_shader;
 mod line;
 mod render_util;
 mod shader;
+mod update_queue;
 mod window;
 
 pub use circle::*;
@@ -20,10 +21,13 @@ fn push_charge(
     transform: Point,
     circle: &CircleSender,
     particle: &ParticleSender,
-) {
+) -> u32 {
     let pos = Point(pos.0 * transform.0 - 1.0, 1.0 - pos.1 * transform.1);
     circle.push_circle(pos, 0.1).unwrap();
-    particle.push_charge(pos, charge).unwrap();
+    match particle.push_charge(pos, charge) {
+        Ok(index) => index,
+        Err(..) => panic!("Out of memory"),
+    }
 }
 
 async fn run_async() -> ! {
@@ -55,6 +59,7 @@ async fn run_async() -> ! {
         }
     });
 
+    let mut charge_stack = std::collections::VecDeque::new();
     window.run(
         move || render.render(),
         move |input_event| match input_event {
@@ -62,25 +67,33 @@ async fn run_async() -> ! {
                 reason: InputEventType::MouseLeft,
                 cursor,
             } if cursor.left_down => {
-                push_charge(
+                charge_stack.push_back(push_charge(
                     Point(cursor.x, cursor.y),
                     1.0,
                     transform,
                     &circle_sender,
                     &particle_sender,
-                );
+                ));
             }
             InputEvent {
                 reason: InputEventType::MouseRight,
                 cursor,
             } if cursor.right_down => {
-                push_charge(
+                charge_stack.push_back(push_charge(
                     Point(cursor.x, cursor.y),
                     -1.0,
                     transform,
                     &circle_sender,
                     &particle_sender,
-                );
+                ));
+            }
+            InputEvent {
+                reason: InputEventType::KeyboardButton(true, VirtualKeyCode::Space),
+                ..
+            } => {
+                if let Some(key) = charge_stack.pop_front() {
+                    particle_sender.pop_charge(key).unwrap();
+                }
             }
             _ => {}
         },
