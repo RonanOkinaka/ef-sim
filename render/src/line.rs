@@ -5,11 +5,11 @@ use rand::Rng;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::LinkedList;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use util::math::Point;
 
 use crate::compute_shader::*;
-use crate::render_util::Renderer;
+use crate::render_util::*;
 use crate::shader::WgslLoader;
 use crate::update_queue::{UpdateQueue, UpdateResult};
 
@@ -112,21 +112,39 @@ struct Params {
     particle_lifetime_s: f32,
 }
 
-pub fn particle_renderer(
-    device: &wgpu::Device,
-    adapter: &wgpu::Adapter,
-    surface: &wgpu::Surface,
-) -> (ParticleSender, ParticleRenderer) {
-    let renderer = ParticleRenderer::new(device, adapter, surface);
+pub fn particle_renderer(render_graph: &mut RenderGraph) -> (ParticleSender, usize) {
+    let render = ParticleRenderer::new(render_graph);
+    let sender = ParticleSender {
+        charge_updates: render.charge_updates.clone(),
+        target_num_curves: render.target_num_curves.clone(),
+        particle_lifetime_s: render.particle_lifetime_s.clone(),
+    };
 
-    (
-        ParticleSender {
-            charge_updates: renderer.charge_updates.clone(),
-            target_num_curves: renderer.target_num_curves.clone(),
-            particle_lifetime_s: renderer.particle_lifetime_s.clone(),
-        },
-        renderer,
-    )
+    let render = Arc::new(RwLock::new(render));
+
+    let updater = render.clone();
+    let update_handle = render_graph.add_pass(Box::new(move |context| {
+        updater.write().unwrap().do_update_pass(context);
+    }));
+
+    let popper = render.clone();
+    let pop_handle = render_graph.add_pass(Box::new(move |context| {
+        popper.read().unwrap().do_pop_pass(context);
+    }));
+
+    let render_handle = render_graph.add_pass(Box::new(move |context| {
+        render.read().unwrap().do_render_pass(context);
+    }));
+
+    // These won't run concurrently due to the RwLock, so we might as well
+    // prevent the threads from blocking
+    render_graph.set_sequence(update_handle, RenderOrder::RunsBefore, pop_handle);
+    render_graph.set_sequence(update_handle, RenderOrder::RunsBefore, render_handle);
+
+    // These two can run concurrently, however
+    render_graph.set_sequence(pop_handle, RenderOrder::SubmitsBefore, render_handle);
+
+    (sender, render_handle)
 }
 
 // This is arbitrary, 16MB right now
@@ -146,22 +164,20 @@ const CHARGE_SIZE: u32 = 4 * 4;
 const MAX_POINTS_PER_CURVE: u32 = 10;
 const CHARGE_COLLISION_RADIUS: f32 = 0.1;
 
-impl Renderer for ParticleRenderer {
-    fn render(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        frame_view: &wgpu::TextureView,
-    ) -> wgpu::CommandBuffer {
+impl ParticleRenderer {
+    fn do_update_pass(&mut self, context: &RenderContext) {
         // Update charge buffer
-        self.update_charge_buffer(queue);
+        self.update_charge_buffer(context.queue);
 
         // Change the number of sub-renderers as necessary
         let target_num_curves = self.target_num_curves.load(Ordering::Relaxed);
 
         match target_num_curves.cmp(&self.current_num_curves) {
             CmpOrdering::Greater => {
-                self.increase_num_particles(target_num_curves - self.current_num_curves, device);
+                self.increase_num_particles(
+                    target_num_curves - self.current_num_curves,
+                    context.device,
+                );
             }
             CmpOrdering::Less => {
                 self.decrease_num_particles(self.current_num_curves - target_num_curves);
@@ -180,17 +196,16 @@ impl Renderer for ParticleRenderer {
         };
         self.last_frame = now;
 
-        // Prepare our command encoder
-        let mut encoder =
-            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-
-        // Order matters here! First, update our particles
+        // Particle update pass
+        let mut encoder = context
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
 
             for part_renderer in self.sub_renderers.iter_mut() {
                 part_renderer.do_particle_pass(
-                    queue,
+                    context.queue,
                     &mut pass,
                     Params {
                         rand_value: rand::thread_rng().gen(),
@@ -200,21 +215,37 @@ impl Renderer for ParticleRenderer {
             }
         }
 
-        // Next, pop points as necessary
+        context.submit(encoder.finish()).unwrap();
+    }
+
+    fn do_pop_pass(&self, context: &RenderContext) {
+        let mut encoder = context
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
+        // Pop points as necessary
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
 
-            for part_renderer in self.sub_renderers.iter_mut() {
+            for part_renderer in self.sub_renderers.iter() {
                 part_renderer.do_pop_pass(&mut pass);
             }
         }
+
+        context.submit(encoder.finish()).unwrap();
+    }
+
+    fn do_render_pass(&self, context: &RenderContext) {
+        let mut encoder = context
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
         // Finally, draw!
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: frame_view,
+                    view: context.frame_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -224,19 +255,18 @@ impl Renderer for ParticleRenderer {
                 depth_stencil_attachment: None,
             });
 
-            for part_renderer in self.sub_renderers.iter_mut() {
+            for part_renderer in self.sub_renderers.iter() {
                 part_renderer.do_render_pass(&mut pass);
             }
         }
 
-        encoder.finish()
+        context.submit(encoder.finish()).unwrap();
     }
-}
 
-impl ParticleRenderer {
-    fn new(device: &wgpu::Device, adapter: &wgpu::Adapter, surface: &wgpu::Surface) -> Self {
+    fn new(render_graph: &RenderGraph) -> Self {
         // Smaller between the default and max size for a storage buffer
-        let default_buffer_size = device
+        let default_buffer_size = render_graph
+            .device
             .limits()
             .max_storage_buffer_binding_size
             .min(DEFAULT_BUFFER_SIZE);
@@ -268,11 +298,18 @@ impl ParticleRenderer {
         let max_num_curves = curve_buf_size.min(max_num_points / (MAX_POINTS_PER_CURVE + 1));
 
         // Charge buffer size
-        let charge_buf_size_bytes = device.limits().max_uniform_buffer_binding_size.min(16384);
+        let charge_buf_size_bytes = render_graph
+            .device
+            .limits()
+            .max_uniform_buffer_binding_size
+            .min(16384);
         let max_num_charges = charge_buf_size_bytes / CHARGE_SIZE - 1;
 
         // Texture format
-        let format = surface.get_capabilities(adapter).formats[0];
+        let format = render_graph
+            .surface
+            .get_capabilities(&render_graph.adapter)
+            .formats[0];
 
         // Load the shaders
         shader_loader.bind("PUSH_BUF_LOGICAL_SIZE", max_push_per_frame.to_string());
@@ -293,18 +330,25 @@ impl ParticleRenderer {
             include_str!("push_common.wgsl").to_owned(),
         );
 
-        let workgroup_size_x = 256.min(device.limits().max_compute_workgroup_size_x);
+        let workgroup_size_x = render_graph
+            .device
+            .limits()
+            .max_compute_workgroup_size_x
+            .min(256);
         shader_loader.bind("WORKGROUP_SIZE_X", workgroup_size_x.to_string());
 
-        let render_shader = shader_loader.create_shader(device, include_str!("draw_line.wgsl"));
-        let particle_shader = shader_loader.create_shader(device, include_str!("particle.wgsl"));
-        let pop_shader = shader_loader.create_shader(device, include_str!("pop_curve.wgsl"));
+        let render_shader =
+            shader_loader.create_shader(&render_graph.device, include_str!("draw_line.wgsl"));
+        let particle_shader =
+            shader_loader.create_shader(&render_graph.device, include_str!("particle.wgsl"));
+        let pop_shader =
+            shader_loader.create_shader(&render_graph.device, include_str!("pop_curve.wgsl"));
 
         // Create the charge buffer
         let charge_buf = create_buffer_with_size(
-            device,
+            &render_graph.device,
             wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            device.limits().max_uniform_buffer_binding_size,
+            render_graph.device.limits().max_uniform_buffer_binding_size,
         );
 
         println!(
@@ -451,12 +495,12 @@ impl ParticleSubRenderer {
             .run_shared(pass, self.current_num_curves);
     }
 
-    fn do_pop_pass<'a>(&'a mut self, pass: &mut wgpu::ComputePass<'a>) {
+    fn do_pop_pass<'a>(&'a self, pass: &mut wgpu::ComputePass<'a>) {
         self.compute_pop_curve
             .run_indirect_shared(pass, &self.compute_pop_buf, 0);
     }
 
-    fn do_render_pass<'a>(&'a mut self, pass: &mut wgpu::RenderPass<'a>) {
+    fn do_render_pass<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
         pass.execute_bundles([&self.render_bundle]);
     }
 

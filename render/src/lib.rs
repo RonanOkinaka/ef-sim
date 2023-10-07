@@ -13,6 +13,7 @@ pub use line::*;
 pub use window::*;
 
 use pollster::block_on;
+use render_util::*;
 use util::math::Point;
 
 fn push_charge(
@@ -34,17 +35,14 @@ async fn run_async() -> ! {
     let window = Window::with_size("This Should Work...", 640, 480);
     let transform = Point(2. / 640., 2. / 480.);
 
-    let mut render = render_util::RenderGraph::from_window(&window).await;
+    let mut render = RenderGraph::from_window(&window).await;
 
-    let (particle_sender, particle_renderer) =
-        particle_renderer(&render.device, &render.adapter, &render.surface);
+    let (particle_sender, particle_handle) = particle_renderer(&mut render);
 
     // TODO: Choose a maximum value intelligently
-    let (circle_sender, circle_renderer) =
-        circle::circle_renderer(&render.device, &render.adapter, &render.surface, 100);
+    let (circle_sender, circle_handle) = circle::circle_renderer(&mut render, 100);
 
-    render.add_renderer(particle_renderer);
-    render.add_renderer(circle_renderer);
+    render.set_sequence(particle_handle, RenderOrder::SubmitsBefore, circle_handle);
 
     // Help us test changing particle quantities
     println!("Enter the target quantity of particles and press enter.");
@@ -61,7 +59,7 @@ async fn run_async() -> ! {
 
     let mut charge_stack = std::collections::VecDeque::new();
     window.run(
-        move || render.render(),
+        move || render.tick(),
         move |input_event| match input_event {
             InputEvent {
                 reason: InputEventType::MouseLeft,

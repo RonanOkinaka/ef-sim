@@ -1,25 +1,23 @@
 //! Renderer for drawing solid-color, billboarded circles.
 
 use bytemuck::cast_slice;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{mpsc, Arc};
 use util::math::Point;
 use wgpu::util::DeviceExt;
 
-use crate::render_util::Renderer;
+use crate::render_util::*;
 use crate::shader::WgslLoader;
 
 /// Renderer responsible for drawing circle billboards.
 pub struct CircleRenderer {
-    circle_rx: mpsc::Receiver<(Point, f32)>,
-
-    num_verts: u32,
+    num_verts: AtomicU32,
     max_num_verts: u32,
     vertices: wgpu::Buffer,
 
     billboard: wgpu::TextureView,
     billboard_verts: wgpu::Buffer,
     billboard_pipeline: wgpu::RenderPipeline,
-    billboard_ready: bool,
 
     render_pipeline: wgpu::RenderPipeline,
     render_bind_group: wgpu::BindGroup,
@@ -32,16 +30,25 @@ pub struct CircleSender {
 }
 
 pub fn circle_renderer(
-    device: &wgpu::Device,
-    adapter: &wgpu::Adapter,
-    surface: &wgpu::Surface,
+    render_graph: &mut RenderGraph,
     max_num_billboards: u32,
-) -> (CircleSender, CircleRenderer) {
+) -> (CircleSender, usize) {
     let (circle_tx, circle_rx) = mpsc::channel();
-    (
-        CircleSender { circle_tx },
-        CircleRenderer::with_channel(device, adapter, surface, circle_rx, max_num_billboards),
-    )
+
+    let renderer = Arc::new(CircleRenderer::new(render_graph, max_num_billboards));
+
+    let updater = renderer.clone();
+    let update_handle = render_graph.add_pass(Box::new(move |context| {
+        updater.update_with_channel(context, &circle_rx);
+    }));
+
+    let render_handle = render_graph.add_pass(Box::new(move |context| {
+        renderer.render(context);
+    }));
+
+    render_graph.set_sequence(update_handle, RenderOrder::RunsBefore, render_handle);
+
+    (CircleSender { circle_tx }, render_handle)
 }
 
 const FLOATS_PER_VERTEX: u64 = 4;
@@ -49,28 +56,61 @@ const VERTEX_SIZE: u64 = 4 * FLOATS_PER_VERTEX;
 const VERTS_PER_QUAD: u64 = 6;
 const FLOATS_PER_QUAD: u64 = VERTS_PER_QUAD * 4;
 
-impl Renderer for CircleRenderer {
-    fn render(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        frame_view: &wgpu::TextureView,
-    ) -> wgpu::CommandBuffer {
-        let mut encoder =
-            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+impl CircleRenderer {
+    fn update_with_channel(
+        &self,
+        context: &RenderContext,
+        circle_rx: &mpsc::Receiver<(Point, f32)>,
+    ) {
+        let current_num_verts = self.num_verts.load(Ordering::Acquire);
+        let num_quads_allowed = (self.max_num_verts - current_num_verts) / VERTS_PER_QUAD as u32;
 
-        if !self.billboard_ready {
-            self.billboard_ready = true;
-            self.create_billboard(&mut encoder);
+        let verts: Vec<_> = circle_rx
+            .try_iter()
+            .map(|(pos, radius)| Self::circle_to_slice(pos, radius))
+            .take(num_quads_allowed as usize)
+            .flatten()
+            .collect();
+
+        if !verts.is_empty() {
+            // Write the new vertex data
+            context.queue.write_buffer(
+                &self.vertices,
+                VERTEX_SIZE * current_num_verts as u64,
+                cast_slice(verts.as_slice()),
+            );
+
+            // If this is our first quad, create the billboard texture as well
+            if current_num_verts == 0 {
+                let mut encoder = context
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
+                self.create_billboard(&mut encoder);
+
+                context.queue.submit([encoder.finish()]);
+            }
+
+            // Update our count
+            self.num_verts.fetch_add(
+                verts.len() as u32 / FLOATS_PER_VERTEX as u32,
+                Ordering::Release,
+            );
         }
 
-        self.update(queue);
+        context.submit_empty().unwrap();
+    }
+
+    fn render(&self, context: &RenderContext) {
+        let mut encoder = context
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: frame_view,
+                    view: context.frame_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Load,
@@ -83,38 +123,36 @@ impl Renderer for CircleRenderer {
             pass.set_pipeline(&self.render_pipeline);
             pass.set_bind_group(0, &self.render_bind_group, &[]);
             pass.set_vertex_buffer(0, self.vertices.slice(..));
-            pass.draw(0..self.num_verts, 0..1);
+            pass.draw(0..self.num_verts.load(Ordering::Acquire), 0..1);
         }
 
-        encoder.finish()
+        context.submit(encoder.finish()).unwrap();
     }
-}
 
-impl CircleRenderer {
-    fn with_channel(
-        device: &wgpu::Device,
-        adapter: &wgpu::Adapter,
-        surface: &wgpu::Surface,
-        circle_rx: mpsc::Receiver<(Point, f32)>,
-        max_num_billboards: u32,
-    ) -> Self {
+    fn new(render_graph: &mut RenderGraph, max_num_billboards: u32) -> Self {
         // Create the billboard generation pipeline
-        let best_format = surface.get_capabilities(adapter).formats[0];
+        let best_format = render_graph
+            .surface
+            .get_capabilities(&render_graph.adapter)
+            .formats[0];
 
-        let billboard_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: None,
-            size: wgpu::Extent3d {
-                width: 512, // TODO: This should be dynamic
-                height: 512,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: best_format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
+        let billboard_texture = render_graph
+            .device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d {
+                    width: 512, // TODO: This should be dynamic
+                    height: 512,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: best_format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
 
         let billboard = billboard_texture.create_view(&wgpu::TextureViewDescriptor {
             label: None,
@@ -132,184 +170,190 @@ impl CircleRenderer {
             "BILLBOARD_TEXTURE_DIM",
             billboard_texture.width().to_string(),
         );
-        let shader = shader_loader.create_shader(device, include_str!("draw_circle_texture.wgsl"));
+        let shader = shader_loader.create_shader(
+            &render_graph.device,
+            include_str!("draw_circle_texture.wgsl"),
+        );
 
-        let billboard_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None,
-            bind_group_layouts: &[],
-            push_constant_ranges: &[],
-        });
+        let billboard_layout =
+            render_graph
+                .device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: None,
+                    bind_group_layouts: &[],
+                    push_constant_ranges: &[],
+                });
 
-        let billboard_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: None,
-            layout: Some(&billboard_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: "vertex_passthrough",
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: 8,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x2],
-                }],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: "fragment_pixel_perfect",
-                targets: &[Some(best_format.into())],
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-        });
+        let billboard_pipeline =
+            render_graph
+                .device
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: None,
+                    layout: Some(&billboard_layout),
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: "vertex_passthrough",
+                        buffers: &[wgpu::VertexBufferLayout {
+                            array_stride: 8,
+                            step_mode: wgpu::VertexStepMode::Vertex,
+                            attributes: &wgpu::vertex_attr_array![0 => Float32x2],
+                        }],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: "fragment_pixel_perfect",
+                        targets: &[Some(best_format.into())],
+                    }),
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview: None,
+                });
 
-        let billboard_verts = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None,
-            contents: cast_slice::<f32, u8>(&[
-                1.0, 1.0, // 0
-                -1.0, 1.0, // 1
-                -1.0, -1.0, // 2
-                -1.0, -1.0, // 2
-                1.0, -1.0, // 3
-                1.0, 1.0, // 0
-            ]),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
+        let billboard_verts =
+            render_graph
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: cast_slice::<f32, u8>(&[
+                        1.0, 1.0, // 0
+                        -1.0, 1.0, // 1
+                        -1.0, -1.0, // 2
+                        -1.0, -1.0, // 2
+                        1.0, -1.0, // 3
+                        1.0, 1.0, // 0
+                    ]),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
 
         // Create the standard render pipeline
-        let vertices = device.create_buffer(&wgpu::BufferDescriptor {
+        let vertices = render_graph.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: VERTEX_SIZE * 6 * max_num_billboards as u64,
             mapped_at_creation: false,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
 
-        let shader =
-            shader_loader.create_shader(device, include_str!("draw_circle_billboards.wgsl"));
+        let shader = shader_loader.create_shader(
+            &render_graph.device,
+            include_str!("draw_circle_billboards.wgsl"),
+        );
 
         let render_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: None,
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
+            render_graph
+                .device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: None,
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
                         },
-                        count: None,
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
+                    ],
+                });
+
+        let render_layout =
+            render_graph
+                .device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: None,
+                    bind_group_layouts: &[&render_bind_group_layout],
+                    push_constant_ranges: &[],
+                });
+
+        let render_pipeline =
+            render_graph
+                .device
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: None,
+                    layout: Some(&render_layout),
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: "vertex_passthrough_tex",
+                        buffers: &[wgpu::VertexBufferLayout {
+                            array_stride: VERTEX_SIZE,
+                            step_mode: wgpu::VertexStepMode::Vertex,
+                            attributes: &wgpu::vertex_attr_array![
+                                0 => Float32x2,
+                                1 => Float32x2,
+                            ],
+                        }],
                     },
-                    wgpu::BindGroupLayoutEntry {
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: "fragment_billboard",
+                        targets: &[Some(wgpu::ColorTargetState {
+                            blend: Some(wgpu::BlendState {
+                                color: wgpu::BlendComponent {
+                                    src_factor: wgpu::BlendFactor::SrcAlpha,
+                                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                    operation: wgpu::BlendOperation::Add,
+                                },
+                                alpha: wgpu::BlendComponent::OVER,
+                            }),
+                            ..render_graph
+                                .surface
+                                .get_capabilities(&render_graph.adapter)
+                                .formats[0]
+                                .into()
+                        })],
+                    }),
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview: None,
+                });
+
+        let sampler = render_graph
+            .device
+            .create_sampler(&wgpu::SamplerDescriptor {
+                label: None,
+                address_mode_u: wgpu::AddressMode::ClampToEdge,
+                address_mode_v: wgpu::AddressMode::ClampToEdge,
+                address_mode_w: wgpu::AddressMode::ClampToEdge,
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Nearest,
+                ..Default::default()
+            });
+
+        let render_bind_group = render_graph
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &render_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&billboard),
+                    },
+                    wgpu::BindGroupEntry {
                         binding: 1,
-                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
                     },
                 ],
             });
 
-        let render_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None,
-            bind_group_layouts: &[&render_bind_group_layout],
-            push_constant_ranges: &[],
-        });
-
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: None,
-            layout: Some(&render_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: "vertex_passthrough_tex",
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: VERTEX_SIZE,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![
-                        0 => Float32x2,
-                        1 => Float32x2,
-                    ],
-                }],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: "fragment_billboard",
-                targets: &[Some(wgpu::ColorTargetState {
-                    blend: Some(wgpu::BlendState {
-                        color: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::SrcAlpha,
-                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                            operation: wgpu::BlendOperation::Add,
-                        },
-                        alpha: wgpu::BlendComponent::OVER,
-                    }),
-                    ..surface.get_capabilities(adapter).formats[0].into()
-                })],
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-        });
-
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: None,
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
-
-        let render_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &render_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&billboard),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-            ],
-        });
-
         Self {
-            circle_rx,
             vertices,
-            num_verts: 0,
+            num_verts: AtomicU32::new(0),
             max_num_verts: max_num_billboards * VERTS_PER_QUAD as u32,
             billboard,
             billboard_verts,
             billboard_pipeline,
-            billboard_ready: false,
             render_pipeline,
             render_bind_group,
-        }
-    }
-
-    fn update(&mut self, queue: &wgpu::Queue) {
-        let num_quads_allowed = (self.max_num_verts - self.num_verts) / VERTS_PER_QUAD as u32;
-
-        let verts: Vec<_> = self
-            .circle_rx
-            .try_iter()
-            .map(|(pos, radius)| Self::circle_to_slice(pos, radius))
-            .take(num_quads_allowed as usize)
-            .flatten()
-            .collect();
-
-        if !verts.is_empty() {
-            queue.write_buffer(
-                &self.vertices,
-                VERTEX_SIZE * self.num_verts as u64,
-                cast_slice(verts.as_slice()),
-            );
-
-            self.num_verts += verts.len() as u32 / FLOATS_PER_VERTEX as u32;
         }
     }
 
