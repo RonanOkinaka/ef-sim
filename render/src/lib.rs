@@ -1,109 +1,84 @@
 //! Re-export the relevant (i.e. public) parts of modules from this workspace.
 
+mod circle;
 mod compute_shader;
 mod line;
+mod particle_simulation;
+mod render_util;
 mod shader;
+mod update_queue;
 mod window;
 
-pub use line::*;
+use particle_simulation::*;
 pub use window::*;
 
 use pollster::block_on;
+use render_util::*;
 use util::math::Point;
 
 async fn run_async() -> ! {
     let window = Window::with_size("This Should Work...", 640, 480);
+    let transform = Point(2. / 640., 2. / 480.);
 
-    // TODO: Hard-coded for now
-    let (mx, my): (f32, f32) = (2. / 640., 2. / 480.);
+    let mut render = RenderGraph::from_window(&window).await;
+    let sender = particle_simulation(&mut render);
 
-    let instance = wgpu::Instance::default();
+    sender.set_particle_lifetime(10.0);
 
-    // Unfortunate but unavoidable
-    let surface = unsafe { instance.create_surface(&window) }.unwrap();
-    let adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            force_fallback_adapter: false,
-            compatible_surface: Some(&surface),
-        })
-        .await
-        .expect("Failed to find an appropriate adapter");
+    // Help us test changing particle quantities
+    println!("Enter the target quantity of particles and press enter.");
+    let thread_particle_sender = sender.clone();
+    std::thread::spawn(move || loop {
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).unwrap();
 
-    // Create the logical device and command queue
-    let (device, queue) = adapter
-        .request_device(
-            &wgpu::DeviceDescriptor {
-                label: None,
-                features: wgpu::Features::empty(),
-                limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
-            },
-            None,
-        )
-        .await
-        .expect("Failed to create device");
+        match line.trim_end().parse::<u32>() {
+            Ok(num_curves) => thread_particle_sender.set_num_curves(num_curves),
+            Err(..) => println!("Please enter a positive integer!"),
+        }
+    });
 
-    let (width, height) = window.get_size();
-    let swapchain_capabilities = surface.get_capabilities(&adapter);
-    let swapchain_format = swapchain_capabilities.formats[0];
-
-    let config = wgpu::SurfaceConfiguration {
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-        format: swapchain_format,
-        width,
-        height,
-        present_mode: wgpu::PresentMode::Fifo,
-        alpha_mode: swapchain_capabilities.alpha_modes[0],
-        view_formats: vec![],
-    };
-
-    surface.configure(&device, &config);
-
-    let (sender, mut renderer) = line_renderer(&device, &adapter, &surface);
-    let mut curve_index = 0;
-
+    let mut charge_stack = std::collections::VecDeque::new();
     window.run(
-        move || {
-            let curr_frame = surface
-                .get_current_texture()
-                .expect("Failed to retrieve swapchain texture");
-            let frame_view = curr_frame
-                .texture
-                .create_view(&wgpu::TextureViewDescriptor::default());
-
-            renderer.render(&device, &queue, &frame_view);
-
-            curr_frame.present();
-        },
-        move |input_event| {
-            match input_event.reason {
-                InputEventType::MouseLeft => {
-                    let cursor = input_event.cursor;
-                    if cursor.left_down {
-                        let pos = Point(cursor.x * mx - 1.0, 1.0 - cursor.y * my);
-                        sender
-                            .push_point(pos, curve_index)
-                            .expect("Render thread should never hang up");
-                    }
-                }
-                InputEventType::KeyboardButton(true, key) => {
-                    match key {
-                        // TODO: This could probably be a map and a macro...
-                        VirtualKeyCode::Key1 => curve_index = 0,
-                        VirtualKeyCode::Key2 => curve_index = 1,
-                        VirtualKeyCode::Key3 => curve_index = 2,
-                        VirtualKeyCode::Key4 => curve_index = 3,
-                        VirtualKeyCode::Key5 => curve_index = 4,
-                        VirtualKeyCode::Space => {
-                            sender
-                                .pop_point(curve_index)
-                                .expect("Render thread should never hang up");
-                        }
-                        _ => {}
-                    }
-                }
-                _ => {}
+        move || render.tick(),
+        move |input_event| match input_event {
+            InputEvent {
+                reason: InputEventType::MouseLeft,
+                cursor,
+            } if cursor.left_down => {
+                charge_stack.push_back(
+                    sender
+                        .push_charge(
+                            Point(cursor.x * transform.0 - 1.0, 1.0 - cursor.y * transform.1),
+                            1.0,
+                            0.1,
+                        )
+                        .unwrap_or_else(|_| panic!("blah")),
+                );
             }
+            InputEvent {
+                reason: InputEventType::MouseRight,
+                cursor,
+            } if cursor.right_down => {
+                charge_stack.push_back(
+                    sender
+                        .push_charge(
+                            Point(cursor.x * transform.0 - 1.0, 1.0 - cursor.y * transform.1),
+                            -1.0,
+                            0.1,
+                        )
+                        .unwrap_or_else(|_| panic!("blah")),
+                );
+            }
+            InputEvent {
+                reason: InputEventType::KeyboardButton(true, VirtualKeyCode::Space),
+                ..
+            } => {
+                if let Some(key) = charge_stack.pop_front() {
+                    sender.pop_charge(key).unwrap();
+                }
+            }
+            _ => {}
         },
     );
 }

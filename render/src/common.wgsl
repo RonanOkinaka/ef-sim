@@ -26,6 +26,15 @@ struct IndexBuffer {
 struct Curve {
     head_index: i32,
     tail_index: i32,
+    num_points: i32,
+    lifetime: f32,
+}
+
+/// Buffer for all curves.
+struct CurveBuffer {
+    target_size: i32,
+    size: atomic<i32>,
+    data: array<Curve, $$CURVE_BUF_LOGICAL_SIZE$$>,
 }
 
 /// Flat free list for buffer pools.
@@ -43,13 +52,32 @@ struct IndirectIndexedDraw {
     indx_offset: u32,
     vert_offset: u32,
     inst_offset: u32,
-    _pad: u32,
 }
 
 /// Stores our higher-level logical constructs.
 struct ComputeState {
     draw: IndirectIndexedDraw,
-    curves: array<Curve, $$CURVE_BUF_LOGICAL_SIZE$$>,
+    dispatch_size: u32,
+    curves: CurveBuffer,
     vert_free: FreeList,
     indx_free: FreeList,
+}
+
+/// Data for a compute shader dispatch.
+struct IndirectComputeDispatch {
+    workgroups_x: atomic<u32>,
+    workgroups_y: u32, // For our purposes, y and z will always be 1
+    workgroups_z: u32,
+}
+
+/// Data required for popping from a curve.
+struct PopCommand {
+    curve_index: u32,
+}
+
+/// Buffer for accumulating curve-pop commands.
+struct PopCommandBuffer {
+    dispatch: IndirectComputeDispatch,
+    size: atomic<u32>,
+    data: array<PopCommand, $$POP_BUF_LOGICAL_SIZE$$>,
 }
