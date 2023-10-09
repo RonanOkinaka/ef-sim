@@ -1,8 +1,25 @@
 //! Utility for dealing with many writers pushing to and popping from
 //! one buffer when order does not matter.
 
+use bytemuck::{cast_slice, Pod};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+
+/// Identifies an object that supports pushing, erasing by swap, and
+/// retrieving its size (obvious example: Vec<>)
+pub trait PushAndSwapPop<T> {
+    /// Push value into container.
+    fn push(&mut self, value: T);
+
+    /// Pop value from container by swapping to back.
+    fn pop(&mut self, index: usize);
+
+    /// Return the length of the container.
+    fn len(&self) -> usize;
+
+    /// Any operations that must be done after CPU-side updates.
+    fn finalize(&self, result: UpdateResult);
+}
 
 /// Abstraction over a shared buffer where updates are queued to be done
 /// at a later time, with compaction.
@@ -18,11 +35,26 @@ pub enum UpdateType<T> {
     SwapPop(usize),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum UpdateResult {
     Same,
     SizeOnly(usize),
     Range(usize, usize),
+}
+
+/// An admittedly not very general solution to tightly update WGPU buffers
+/// given a mirrored version on the CPU.
+pub struct VecToWgpuBufHelper<'a, T> {
+    /// Offset of the data in bytes.
+    pub data_off: Option<u64>,
+    /// Offset of the size information in bytes.
+    pub size_off: Option<u64>,
+    /// Data vector.
+    pub vec: &'a mut Vec<T>,
+    /// Data buffer.
+    pub buf: &'a wgpu::Buffer,
+    /// WGPU's queue.
+    pub queue: &'a wgpu::Queue,
 }
 
 struct UpdateQueueInner<T> {
@@ -117,8 +149,12 @@ impl<T> UpdateQueue<T> {
 
     /// Apply the queued updates to a Vec<>, and return the bounds that were
     /// updated [min, max). Cleared after.
-    pub fn apply_updates(&self, container: &mut Vec<T>) -> UpdateResult {
-        // TODO: Must this be a Vec<>?
+    /// Calls finalize() on the provided container, but still returns
+    /// UpdateResult if it is convenient.
+    pub fn apply_updates<U>(&self, container: &mut U) -> UpdateResult
+    where
+        U: PushAndSwapPop<T>,
+    {
         let mut min = usize::MAX;
         let mut max = usize::MIN;
 
@@ -134,19 +170,81 @@ impl<T> UpdateQueue<T> {
                 min = min.min(index);
                 max = max.max(index);
 
-                container.swap_remove(index);
+                container.pop(index);
             }
         });
 
         let len = container.len();
+        let result;
 
         if min == usize::MAX {
-            UpdateResult::Same
+            result = UpdateResult::Same;
         } else if min >= len {
-            UpdateResult::SizeOnly(len)
+            result = UpdateResult::SizeOnly(len);
         } else {
-            UpdateResult::Range(min, (max + 1).min(len))
+            result = UpdateResult::Range(min, (max + 1).min(len));
         }
+
+        container.finalize(result);
+        result
+    }
+}
+
+impl<'a, T> PushAndSwapPop<T> for VecToWgpuBufHelper<'a, T>
+where
+    T: Pod,
+{
+    fn push(&mut self, value: T) {
+        self.vec.push(value);
+    }
+
+    fn pop(&mut self, index: usize) {
+        self.vec.swap_remove(index);
+    }
+
+    fn len(&self) -> usize {
+        self.vec.len()
+    }
+
+    fn finalize(&self, result: UpdateResult) {
+        match result {
+            UpdateResult::Range(min, max) => {
+                // If we have data to write, do so
+                if let Some(data_off) = self.data_off {
+                    self.queue.write_buffer(
+                        self.buf,
+                        data_off + (min * std::mem::size_of::<T>()) as u64,
+                        cast_slice(&self.vec[min..max]),
+                    );
+                }
+            }
+            UpdateResult::SizeOnly(..) => { /* Just update the size */ },
+            UpdateResult::Same => return, // Early return if nothing happened
+        }
+
+        // Update the buffer size
+        if let Some(size_off) = self.size_off {
+            self.queue
+                .write_buffer(self.buf, size_off, cast_slice(&[self.vec.len() as u32]));
+        }
+    }
+}
+
+impl<T> PushAndSwapPop<T> for Vec<T> {
+    fn push(&mut self, value: T) {
+        self.push(value);
+    }
+
+    fn pop(&mut self, index: usize) {
+        self.swap_remove(index);
+    }
+
+    fn len(&self) -> usize {
+        self.len()
+    }
+
+    fn finalize(&self, _: UpdateResult) {
+        // No-op
     }
 }
 

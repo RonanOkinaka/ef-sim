@@ -1,18 +1,16 @@
 //! Renderer for drawing solid-color, billboarded circles.
 
 use bytemuck::cast_slice;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{mpsc, Arc};
 use util::math::Point;
 use wgpu::util::DeviceExt;
 
 use crate::render_util::*;
 use crate::shader::WgslLoader;
+use crate::update_queue::{PushAndSwapPop, UpdateResult};
 
 /// Renderer responsible for drawing circle billboards.
 pub struct CircleRenderer {
-    num_verts: AtomicU32,
-    max_num_verts: u32,
+    local_verts: Vec<(Point, f32)>,
     vertices: wgpu::Buffer,
 
     billboard: wgpu::TextureView,
@@ -23,85 +21,38 @@ pub struct CircleRenderer {
     render_bind_group: wgpu::BindGroup,
 }
 
-/// Channel by which one may request a circle be drawn.
-#[derive(Clone)]
-pub struct CircleSender {
-    circle_tx: mpsc::Sender<(Point, f32)>,
-}
+/// Opaque update strategy for use with UpdateQueue.
+pub struct CircleUpdater<'a, 'b, 'c> {
+    render: &'a mut CircleRenderer,
+    billboard_ready: bool,
 
-pub fn circle_renderer(
-    render_graph: &mut RenderGraph,
-    max_num_billboards: u32,
-) -> (CircleSender, usize) {
-    let (circle_tx, circle_rx) = mpsc::channel();
-
-    let renderer = Arc::new(CircleRenderer::new(render_graph, max_num_billboards));
-
-    let updater = renderer.clone();
-    let update_handle = render_graph.add_pass(Box::new(move |context| {
-        updater.update_with_channel(context, &circle_rx);
-    }));
-
-    let render_handle = render_graph.add_pass(Box::new(move |context| {
-        renderer.render(context);
-    }));
-
-    render_graph.set_sequence(update_handle, RenderOrder::RunsBefore, render_handle);
-
-    (CircleSender { circle_tx }, render_handle)
+    // TODO: I'm not 100% sure about these lifetimes...
+    context: &'a RenderContext<'b, 'c>,
 }
 
 const FLOATS_PER_VERTEX: u64 = 4;
 const VERTEX_SIZE: u64 = 4 * FLOATS_PER_VERTEX;
 const VERTS_PER_QUAD: u64 = 6;
 const FLOATS_PER_QUAD: u64 = VERTS_PER_QUAD * 4;
+const QUAD_SIZE: u64 = VERTEX_SIZE * VERTS_PER_QUAD;
+
+pub type BillboardQuad = [f32; FLOATS_PER_QUAD as usize];
 
 impl CircleRenderer {
-    fn update_with_channel(
-        &self,
-        context: &RenderContext,
-        circle_rx: &mpsc::Receiver<(Point, f32)>,
-    ) {
-        let current_num_verts = self.num_verts.load(Ordering::Acquire);
-        let num_quads_allowed = (self.max_num_verts - current_num_verts) / VERTS_PER_QUAD as u32;
+    pub fn get_updater<'a, 'b, 'c>(
+        &'a mut self,
+        context: &'a RenderContext<'b, 'c>,
+    ) -> CircleUpdater<'a, 'b, 'c> {
+        let billboard_ready = !self.local_verts.is_empty();
 
-        let verts: Vec<_> = circle_rx
-            .try_iter()
-            .map(|(pos, radius)| Self::circle_to_slice(pos, radius))
-            .take(num_quads_allowed as usize)
-            .flatten()
-            .collect();
-
-        if !verts.is_empty() {
-            // Write the new vertex data
-            context.queue.write_buffer(
-                &self.vertices,
-                VERTEX_SIZE * current_num_verts as u64,
-                cast_slice(verts.as_slice()),
-            );
-
-            // If this is our first quad, create the billboard texture as well
-            if current_num_verts == 0 {
-                let mut encoder = context
-                    .device
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-
-                self.create_billboard(&mut encoder);
-
-                context.queue.submit([encoder.finish()]);
-            }
-
-            // Update our count
-            self.num_verts.fetch_add(
-                verts.len() as u32 / FLOATS_PER_VERTEX as u32,
-                Ordering::Release,
-            );
+        CircleUpdater {
+            render: self,
+            billboard_ready,
+            context,
         }
-
-        context.submit_empty().unwrap();
     }
 
-    fn render(&self, context: &RenderContext) {
+    pub fn render(&self, context: &RenderContext) {
         let mut encoder = context
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -123,13 +74,16 @@ impl CircleRenderer {
             pass.set_pipeline(&self.render_pipeline);
             pass.set_bind_group(0, &self.render_bind_group, &[]);
             pass.set_vertex_buffer(0, self.vertices.slice(..));
-            pass.draw(0..self.num_verts.load(Ordering::Acquire), 0..1);
+            pass.draw(
+                0..(self.local_verts.len() as u32 * VERTS_PER_QUAD as u32),
+                0..1,
+            );
         }
 
         context.submit(encoder.finish()).unwrap();
     }
 
-    fn new(render_graph: &mut RenderGraph, max_num_billboards: u32) -> Self {
+    pub fn new(render_graph: &mut RenderGraph, max_num_billboards: u32) -> Self {
         // Create the billboard generation pipeline
         let best_format = render_graph
             .surface
@@ -347,8 +301,7 @@ impl CircleRenderer {
 
         Self {
             vertices,
-            num_verts: AtomicU32::new(0),
-            max_num_verts: max_num_billboards * VERTS_PER_QUAD as u32,
+            local_verts: Vec::new(),
             billboard,
             billboard_verts,
             billboard_pipeline,
@@ -358,7 +311,7 @@ impl CircleRenderer {
     }
 
     #[rustfmt::skip]
-    fn circle_to_slice(pos: Point, width: f32) -> [f32; FLOATS_PER_QUAD as usize] {
+    pub fn circle_to_slice(pos: Point, width: f32) -> [f32; FLOATS_PER_QUAD as usize] {
         let right = pos.0 + width;
         let left = pos.0 - width;
         let top = pos.1 + width;
@@ -396,12 +349,52 @@ impl CircleRenderer {
     }
 }
 
-impl CircleSender {
-    pub fn push_circle(
-        &self,
-        pos: Point,
-        radius: f32,
-    ) -> Result<(), mpsc::SendError<(Point, f32)>> {
-        self.circle_tx.send((pos, radius))
+impl<'a, 'b, 'c> PushAndSwapPop<(Point, f32)> for CircleUpdater<'a, 'b, 'c> {
+    fn push(&mut self, value: (Point, f32)) {
+        self.render.local_verts.push(value);
+    }
+
+    fn pop(&mut self, index: usize) {
+        self.render.local_verts.swap_remove(index);
+    }
+
+    fn len(&self) -> usize {
+        self.render.local_verts.len()
+    }
+
+    fn finalize(&self, result: UpdateResult) {
+        if let UpdateResult::Range(min, max) = result {
+            // Copy the buffer data from our internal representation
+            let gpu_range = (min as u64 * QUAD_SIZE)..(max as u64 * QUAD_SIZE);
+
+            let write_slice = self.context.queue.write_buffer_with(
+                &self.render.vertices,
+                gpu_range.start,
+                std::num::NonZeroU64::new(gpu_range.end - gpu_range.start).unwrap(),
+            );
+
+            let circle_to_quad = self.render.local_verts[min..max]
+                .iter()
+                .map(|(pos, radius)| CircleRenderer::circle_to_slice(*pos, *radius));
+
+            write_slice
+                .unwrap()
+                .chunks_exact_mut(std::mem::size_of::<BillboardQuad>())
+                .zip(circle_to_quad)
+                .for_each(move |(slice, quad)| {
+                    slice.copy_from_slice(cast_slice(&quad));
+                });
+
+            // If this was our first quad, create the billboard texture
+            if !self.billboard_ready {
+                let mut encoder = self
+                    .context
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+                self.render.create_billboard(&mut encoder);
+
+                self.context.submit(encoder.finish()).unwrap();
+            }
+        }
     }
 }

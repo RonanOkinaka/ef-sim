@@ -5,13 +5,13 @@ use rand::Rng;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::LinkedList;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use util::math::Point;
 
 use crate::compute_shader::*;
 use crate::render_util::*;
 use crate::shader::WgslLoader;
-use crate::update_queue::{UpdateQueue, UpdateResult};
+use crate::update_queue::VecToWgpuBufHelper;
 
 /// State required for rendering lines.
 pub struct ParticleRenderer {
@@ -22,7 +22,6 @@ pub struct ParticleRenderer {
     particle_shader: wgpu::ShaderModule,
     pop_shader: wgpu::ShaderModule,
 
-    charge_updates: UpdateQueue<Charge>,
     charge_vec: Vec<Charge>,
     charge_buf: wgpu::Buffer,
 
@@ -41,9 +40,29 @@ pub struct ParticleRenderer {
 /// State required for requesting a line be rendered.
 #[derive(Clone)]
 pub struct ParticleSender {
-    charge_updates: UpdateQueue<Charge>,
     target_num_curves: Arc<AtomicU32>,
     particle_lifetime_s: Arc<AtomicU32>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+pub struct ParticleBufferLimits {
+    pub max_num_points: u32,
+    pub max_num_curves: u32,
+    pub max_num_charges: u32,
+
+    pub default_buffer_size: u32,
+    pub curve_buf_size_bytes: u32,
+
+    pub workgroup_size_x: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct Charge {
+    pub pos: Point,
+    pub charge: f32,
+    pub _pad: u32,
 }
 
 struct ParticleSubRenderer {
@@ -58,19 +77,6 @@ struct ParticleSubRenderer {
 
     target_num_curves: u32,
     current_num_curves: u32,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug)]
-struct ParticleBufferLimits {
-    max_num_points: u32,
-    max_num_curves: u32,
-    max_num_charges: u32,
-
-    default_buffer_size: u32,
-    curve_buf_size_bytes: u32,
-
-    workgroup_size_x: u32,
 }
 
 #[repr(C)]
@@ -98,53 +104,10 @@ struct Curve {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct Charge {
-    pos: Point,
-    charge: f32,
-    _pad: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
 struct Params {
     rand_value: u32,
     tick_s: f32,
     particle_lifetime_s: f32,
-}
-
-pub fn particle_renderer(render_graph: &mut RenderGraph) -> (ParticleSender, usize) {
-    let render = ParticleRenderer::new(render_graph);
-    let sender = ParticleSender {
-        charge_updates: render.charge_updates.clone(),
-        target_num_curves: render.target_num_curves.clone(),
-        particle_lifetime_s: render.particle_lifetime_s.clone(),
-    };
-
-    let render = Arc::new(RwLock::new(render));
-
-    let updater = render.clone();
-    let update_handle = render_graph.add_pass(Box::new(move |context| {
-        updater.write().unwrap().do_update_pass(context);
-    }));
-
-    let popper = render.clone();
-    let pop_handle = render_graph.add_pass(Box::new(move |context| {
-        popper.read().unwrap().do_pop_pass(context);
-    }));
-
-    let render_handle = render_graph.add_pass(Box::new(move |context| {
-        render.read().unwrap().do_render_pass(context);
-    }));
-
-    // These won't run concurrently due to the RwLock, so we might as well
-    // prevent the threads from blocking
-    render_graph.set_sequence(update_handle, RenderOrder::RunsBefore, pop_handle);
-    render_graph.set_sequence(update_handle, RenderOrder::RunsBefore, render_handle);
-
-    // These two can run concurrently, however
-    render_graph.set_sequence(pop_handle, RenderOrder::SubmitsBefore, render_handle);
-
-    (sender, render_handle)
 }
 
 // This is arbitrary, 16MB right now
@@ -165,10 +128,22 @@ const MAX_POINTS_PER_CURVE: u32 = 10;
 const CHARGE_COLLISION_RADIUS: f32 = 0.1;
 
 impl ParticleRenderer {
-    fn do_update_pass(&mut self, context: &RenderContext) {
-        // Update charge buffer
-        self.update_charge_buffer(context.queue);
+    pub fn get_charge_updater<'a>(
+        &'a mut self,
+        context: &'a RenderContext,
+    ) -> VecToWgpuBufHelper<'a, Charge> {
+        // TODO: This completely breaks encapsulation but I can't think of a better way
+        // Just try not to misuse it :P
+        VecToWgpuBufHelper {
+            data_off: Some(CHARGE_SIZE.into()),
+            size_off: Some(0),
+            vec: &mut self.charge_vec,
+            buf: &self.charge_buf,
+            queue: context.queue,
+        }
+    }
 
+    pub fn do_update_pass(&mut self, context: &RenderContext) {
         // Change the number of sub-renderers as necessary
         let target_num_curves = self.target_num_curves.load(Ordering::Relaxed);
 
@@ -218,7 +193,7 @@ impl ParticleRenderer {
         context.submit(encoder.finish()).unwrap();
     }
 
-    fn do_pop_pass(&self, context: &RenderContext) {
+    pub fn do_pop_pass(&self, context: &RenderContext) {
         let mut encoder = context
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -235,7 +210,7 @@ impl ParticleRenderer {
         context.submit(encoder.finish()).unwrap();
     }
 
-    fn do_render_pass(&self, context: &RenderContext) {
+    pub fn do_render_pass(&self, context: &RenderContext) {
         let mut encoder = context
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -263,7 +238,11 @@ impl ParticleRenderer {
         context.submit(encoder.finish()).unwrap();
     }
 
-    fn new(render_graph: &RenderGraph) -> Self {
+    pub fn limits(&self) -> ParticleBufferLimits {
+        self.limits
+    }
+
+    pub fn new(render_graph: &RenderGraph) -> Self {
         // Smaller between the default and max size for a storage buffer
         let default_buffer_size = render_graph
             .device
@@ -365,7 +344,6 @@ impl ParticleRenderer {
 
         Self {
             sub_renderers: LinkedList::new(),
-            charge_updates: UpdateQueue::with_limit(max_num_charges as usize),
             charge_vec: Vec::new(),
             charge_buf,
             target_num_curves: Arc::new(AtomicU32::new(0)),
@@ -431,30 +409,6 @@ impl ParticleRenderer {
 
         // TODO: Write a compaction shader to reduce the number of drawn indices and
         // active curves when their numbers are reduced
-    }
-
-    fn update_charge_buffer(&mut self, queue: &wgpu::Queue) {
-        match self.charge_updates.apply_updates(&mut self.charge_vec) {
-            UpdateResult::Range(min, max) => {
-                // Write the charge buffer
-                // This buffer shouldn't be very large, so copying the whole
-                // thing isn't a huge deal (TODO: segmented write algorithm?)
-                queue.write_buffer(
-                    &self.charge_buf,
-                    (min as u64 + 1) * CHARGE_SIZE as u64,
-                    cast_slice(&self.charge_vec[min..max]),
-                );
-            }
-            UpdateResult::SizeOnly(..) => {} // Only update the size
-            UpdateResult::Same => return,    // Early return if nothing happened
-        };
-
-        // Update the charge counts
-        queue.write_buffer(
-            &self.charge_buf,
-            0,
-            cast_slice(&[self.charge_vec.len() as u32]),
-        );
     }
 }
 
@@ -680,23 +634,10 @@ impl ParticleSubRenderer {
 }
 
 impl ParticleSender {
-    pub fn push_charge(&self, pos: Point, charge: f32) -> Result<u32, (Point, f32)> {
-        let charge_data = Charge {
-            pos,
-            charge,
-            _pad: 0,
-        };
-
-        match self.charge_updates.push(charge_data) {
-            Ok(index) => Ok(index as u32),
-            Err(..) => Err((pos, charge)),
-        }
-    }
-
-    pub fn pop_charge(&self, index: u32) -> Result<(), u32> {
-        match self.charge_updates.pop(index as usize) {
-            Ok(()) => Ok(()),
-            Err(..) => Err(index),
+    pub fn from_renderer(particle_renderer: &ParticleRenderer) -> Self {
+        Self {
+            target_num_curves: particle_renderer.target_num_curves.clone(),
+            particle_lifetime_s: particle_renderer.particle_lifetime_s.clone(),
         }
     }
 
