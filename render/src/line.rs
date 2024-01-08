@@ -17,6 +17,7 @@ use crate::update_queue::VecToWgpuBufHelper;
 pub struct ParticleRenderer {
     // ParticleSubRenderer is very large and we really don't want to copy it
     sub_renderers: LinkedList<ParticleSubRenderer>,
+    stencil_view: wgpu::TextureView,
 
     render_shader: wgpu::ShaderModule,
     particle_shader: wgpu::ShaderModule,
@@ -227,7 +228,14 @@ impl ParticleRenderer {
                         store: true,
                     },
                 })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.stencil_view,
+                    depth_ops: None,
+                    stencil_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(0),
+                        store: true,
+                    }),
+                }),
             });
 
             for part_renderer in self.sub_renderers.iter() {
@@ -330,6 +338,27 @@ impl ParticleRenderer {
             render_graph.device.limits().max_uniform_buffer_binding_size,
         );
 
+        // Create the stencil view
+        let stencil_buf = render_graph
+            .device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size: render_graph
+                    .surface
+                    .get_current_texture()
+                    .unwrap()
+                    .texture
+                    .size(),
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Stencil8,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+
+        let stencil_view = stencil_buf.create_view(&wgpu::TextureViewDescriptor::default());
+
         println!(
             "{:#?}",
             ParticleBufferLimits {
@@ -344,6 +373,7 @@ impl ParticleRenderer {
 
         Self {
             sub_renderers: LinkedList::new(),
+            stencil_view,
             charge_vec: Vec::new(),
             charge_buf,
             target_num_curves: Arc::new(AtomicU32::new(0)),
@@ -555,7 +585,23 @@ impl ParticleSubRenderer {
                 })],
             }),
             primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Stencil8,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
+                stencil: wgpu::StencilState {
+                    front: wgpu::StencilFaceState {
+                        compare: wgpu::CompareFunction::Equal,
+                        fail_op: wgpu::StencilOperation::Keep,
+                        depth_fail_op: wgpu::StencilOperation::Keep,
+                        pass_op: wgpu::StencilOperation::Invert,
+                    },
+                    back: wgpu::StencilFaceState::IGNORE,
+                    read_mask: 0xFF,
+                    write_mask: 0xFF,
+                },
+                bias: wgpu::DepthBiasState::default(),
+            }),
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
         });
@@ -565,7 +611,11 @@ impl ParticleSubRenderer {
             device.create_render_bundle_encoder(&wgpu::RenderBundleEncoderDescriptor {
                 label: None,
                 color_formats: &[Some(format)],
-                depth_stencil: None,
+                depth_stencil: Some(wgpu::RenderBundleDepthStencil {
+                    format: wgpu::TextureFormat::Stencil8,
+                    depth_read_only: true,
+                    stencil_read_only: false,
+                }),
                 sample_count: wgpu::MultisampleState::default().count,
                 multiview: None,
             });
